@@ -1,6 +1,6 @@
-쇼츠메이커 CLOUD V3.1 검사 항목
-- Python 문법 검사
-- streamlit_app.py 단독 import 검사
-- 제목 후보 8개 생성 및 금지 과장어 필터 검사
-- 기존 shorts_engine.py 없이 실행되는 단일 파일 구조 검사
-- Streamlit 서버 기동 및 health endpoint 검사
+쇼츠메이커 CLOUD V3.2 검사 결과
+
+- Python 문법 검사: 예정
+- 외부 shorts_engine import 없음
+- AI 성우/내 목소리 선택 UI 첫 화면 배치
+- 제목 1위 자동 적용 및 메타데이터/파일명 반영
