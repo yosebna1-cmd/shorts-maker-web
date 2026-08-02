@@ -115,6 +115,16 @@ MUSIC_AUTO_BY_CATEGORY = {
     "제품·리뷰": "제품·리뷰 업비트",
 }
 
+TITLE_STYLE_OPTIONS = [
+    "강한 후킹형 · 클릭 유도 추천",
+    "균형형 · 주목도와 신뢰감",
+    "정보형 · 과장 최소화",
+]
+
+TITLE_BANNED_WORDS = {
+    "충격", "소름", "역대급", "무조건", "100%", "대박", "레전드", "실화냐", "미쳤다",
+}
+
 
 @dataclass
 class ArticleData:
@@ -546,7 +556,139 @@ def _category_context(category: str) -> str:
     }.get(category, "확인된 사실과 해석을 구분해서 보는 것이 중요합니다.")
 
 
-def generate_zero_key_plan(article: ArticleData, duration: int, category: str) -> dict[str, Any]:
+
+def _title_subject(title: str, keywords: list[str]) -> str:
+    """기사의 핵심 대상을 짧게 뽑되, 기자 문장을 그대로 복사하지 않는다."""
+    clean_title = _clean_article_title(title)
+    preferred = [word for word in keywords if not re.fullmatch(r"\d+(?:[.,]\d+)?%?", word)]
+    if preferred:
+        subject = " · ".join(preferred[:2])
+    else:
+        subject = _short_caption(clean_title, 24)
+    subject = re.sub(r"\s+", " ", subject).strip(" -|｜·,:;")
+    return _short_caption(subject or "오늘의 이슈", 24)
+
+
+def _title_score(title: str, subject: str, numbers: list[str], style: str) -> int:
+    score = 0
+    length = len(title)
+    if 17 <= length <= 34:
+        score += 25
+    elif 13 <= length <= 40:
+        score += 14
+    else:
+        score -= abs(length - 27)
+    if subject and subject.split(" · ")[0] in title:
+        score += 12
+    if any(number in title for number in numbers):
+        score += 10
+    for phrase in ("주목하는 이유", "핵심은 따로", "결정적 포인트", "놓치면 안 될", "확인된 사실", "진짜 이유", "한 가지"):
+        if phrase in title:
+            score += 7
+    if "?" in title or "…" in title:
+        score += 3
+    if style.startswith("강한"):
+        score += sum(3 for phrase in ("진짜 이유", "핵심은 따로", "결정적", "이것") if phrase in title)
+    elif style.startswith("정보형"):
+        score += sum(4 for phrase in ("핵심 정리", "확인된 사실", "30초") if phrase in title)
+        score -= sum(3 for phrase in ("진짜 이유", "결정적") if phrase in title)
+    if any(word in title for word in TITLE_BANNED_WORDS):
+        score -= 50
+    return score
+
+
+def generate_attention_titles(
+    article: ArticleData,
+    category: str,
+    keywords: list[str] | None = None,
+    numbers: list[str] | None = None,
+    style: str = "강한 후킹형 · 클릭 유도 추천",
+) -> list[str]:
+    """확인된 핵심어와 수치만 이용해 과장·허위 없이 주목형 제목 후보를 만든다."""
+    clean_title = _clean_article_title(article.title)
+    body = re.sub(r"\s+", " ", article.text or "").strip()
+    keywords = keywords or _top_keywords(body, clean_title, 8)
+    numbers = numbers or _extract_numbers(body, 4)
+    subject = _title_subject(clean_title, keywords)
+    source_text = f"{clean_title} {body}"
+
+    strong = [
+        f"{subject}, 지금 사람들이 주목하는 진짜 이유",
+        f"{subject} 소식, 다들 놓친 핵심은 따로 있었다",
+        f"{subject}, 기사 제목만 보면 놓치는 결정적 포인트",
+        f"지금 {subject}가 다시 주목받는 이유",
+        f"{subject}, 결국 중요한 건 이것입니다",
+        f"{subject} 소식에서 꼭 확인해야 할 한 가지",
+    ]
+    balanced = [
+        f"{subject}, 사람들이 주목하는 이유를 정리했습니다",
+        f"{subject} 소식의 핵심, 30초 안에 정리",
+        f"{subject}, 기사에서 놓치기 쉬운 핵심 포인트",
+        f"{subject} 관련 소식, 확인된 내용은 여기까지입니다",
+        f"{subject}, 지금 알아야 할 핵심 한 가지",
+        f"{subject} 소식은 왜 다시 주목받고 있을까요?",
+    ]
+    factual = [
+        f"{subject} 핵심 정리, 확인된 사실만 봤습니다",
+        f"{subject} 소식 30초 요약",
+        f"{subject}, 공식 내용과 추측을 구분해 봤습니다",
+        f"{subject} 관련 확인된 핵심 포인트",
+        f"{subject} 소식에서 꼭 알아야 할 내용",
+        f"{subject}, 기사 핵심만 빠르게 정리",
+    ]
+
+    candidates = strong if style.startswith("강한") else factual if style.startswith("정보형") else balanced
+    candidates = list(candidates)
+
+    if numbers:
+        number = numbers[0]
+        candidates.extend([
+            f"{number}까지… {subject} 소식에서 꼭 볼 부분",
+            f"{subject}, {number}가 중요한 이유",
+        ])
+    if re.search(r"논란|의혹|갑론을박|비판", source_text):
+        candidates.extend([
+            f"{subject} 논란, 확인된 사실만 보면 이렇습니다",
+            f"{subject} 의혹? 사실과 추측을 나눠 봤습니다",
+        ])
+    if re.search(r"해명|반박|사과|입장", source_text):
+        candidates.append(f"{subject}, 공식 입장에서 놓치면 안 될 부분")
+    if re.search(r"결혼|열애|이혼|결별|복귀|컴백", source_text):
+        candidates.append(f"{subject}, 갑자기 알려진 소식의 핵심")
+    if re.search(r"급등|급락|상승|하락|주가|실적", source_text):
+        candidates.extend([
+            f"{subject}, 숫자가 움직인 진짜 배경",
+            f"{subject}, 수치보다 먼저 봐야 할 한 가지",
+        ])
+    if re.search(r"확정|발표|공개|출시|시행", source_text):
+        candidates.append(f"{subject}, 공식 발표에서 놓치면 안 될 핵심")
+
+    category_candidates = {
+        "연예": [f"{subject}, 모두가 궁금해한 핵심만 정리", f"{subject} 소식, 반응이 커진 이유는 이것"],
+        "국내 이슈": [f"{subject}, 지금 반드시 알아야 할 핵심", f"{subject} 이슈, 핵심은 따로 있었습니다"],
+        "해외 이슈": [f"{subject}, 해외 보도에서 놓치면 안 될 부분", f"{subject}, 국내 보도만 보면 놓치는 핵심"],
+        "경제·주식": [f"{subject}, 숫자보다 먼저 봐야 할 한 가지", f"{subject}, 투자자가 놓치기 쉬운 핵심"],
+        "생활정보": [f"{subject}, 나에게 해당되는지 30초 확인", f"{subject}, 모르고 지나치면 놓치는 조건"],
+        "제품·리뷰": [f"{subject}, 사기 전에 반드시 볼 포인트", f"{subject}, 광고보다 먼저 확인할 한 가지"],
+    }
+    candidates.extend(category_candidates.get(category, []))
+    candidates.append(_short_caption(clean_title, 42))
+
+    cleaned: list[str] = []
+    for candidate in candidates:
+        candidate = re.sub(r"\s+", " ", candidate).strip(" -|｜")
+        candidate = candidate.replace("..", ".")
+        if not candidate or any(word in candidate for word in TITLE_BANNED_WORDS):
+            continue
+        if len(candidate) > 44:
+            candidate = _short_caption(candidate, 42)
+        if candidate not in cleaned:
+            cleaned.append(candidate)
+
+    cleaned.sort(key=lambda item: _title_score(item, subject, numbers, style), reverse=True)
+    return cleaned[:8] or [_short_caption(clean_title, 42)]
+
+def generate_zero_key_plan(article: ArticleData, duration: int, category: str, title_style: str = "강한 후킹형 · 클릭 유도 추천") -> dict[str, Any]:
     """외부 생성형 AI 없이 제목·핵심어·수치만 구조화해 새 대본을 만든다."""
     title = _clean_article_title(article.title)
     body = re.sub(r"\s+", " ", article.text or "").strip()
@@ -593,8 +735,11 @@ def generate_zero_key_plan(article: ArticleData, duration: int, category: str) -
     if numbers:
         facts.append(f"주요 수치: {', '.join(numbers)}")
     narration = " ".join(lines)
+    title_candidates = generate_attention_titles(article, category, keywords, numbers, title_style)
     return {
-        "video_title": _short_caption(title, 48),
+        "video_title": title_candidates[0],
+        "title_candidates": title_candidates,
+        "title_style": title_style,
         "hook": hook,
         "narration": narration,
         "description": f"기사에서 확인 가능한 사실과 핵심어를 바탕으로 새롭게 구성한 해설입니다.\n\n참고 출처: {article.publisher or article.url}\n{article.url}",
@@ -686,8 +831,14 @@ def normalize_plan(plan: dict[str, Any], article: ArticleData, duration: int) ->
     if isinstance(hashtags, str):
         hashtags = re.findall(r"#\S+", hashtags) or [hashtags]
 
+    title_candidates = [str(x).strip() for x in (plan.get("title_candidates") or []) if str(x).strip()]
+    selected_title = str(plan.get("video_title") or article.title).strip()
+    if selected_title and selected_title not in title_candidates:
+        title_candidates.insert(0, selected_title)
     return {
-        "video_title": str(plan.get("video_title") or article.title).strip(),
+        "video_title": selected_title,
+        "title_candidates": title_candidates[:8] or [selected_title],
+        "title_style": str(plan.get("title_style") or "강한 후킹형 · 클릭 유도 추천"),
         "hook": str(plan.get("hook") or scenes[0]["narration"]).strip(),
         "narration": narration,
         "description": str(plan.get("description") or f"원문 출처: {article.url}").strip(),
@@ -1573,11 +1724,11 @@ def render_video(
     )
     report_path = temp_root / "copyright_check_report.txt"
     report_path.write_text(
-        "쇼츠메이커 CLOUD V3.0 저작권 안전 점검\n\n"
+        "쇼츠메이커 CLOUD V3.1 저작권 안전 점검\n\n"
         "[대본]\n기사 원문 직접 낭독: 사용 안 함\n사실 기반 재작성: 적용\n"
         f"원문과 최장 연속 유사 어절: {int(plan.get('originality_overlap_words') or 0)}어절\n"
         "[영상]\n기사 대표 사진: 사용 안 함\n방송 캡처/타 유튜브 영상: 사용 안 함\n"
-        "Pexels 또는 자체 생성 그래픽: 사용\n"
+        "프로그램 자체 생성 에디토리얼 그래픽: 사용\n"
         f"[음성]\n나레이션: {voice_mode} / {actual_voice}\n"
         f"[음악]\n{selected_music_label}\n생성형 음악 공개 안내 권장: {music_disclosure}\n\n"
         "주의: 이 보고서는 위험을 줄이기 위한 제작 기록이며 법적 무침해를 보증하지 않습니다.\n",
@@ -1593,7 +1744,7 @@ def render_video(
         encoding="utf-8-sig",
     )
 
-    zip_path = temp_root / "shorts_result_v30.zip"
+    zip_path = temp_root / "shorts_result_v31.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in (
             final_video, audio_path, srt_path, script_path, metadata_path, source_path,
@@ -1615,9 +1766,9 @@ def render_video(
         "zip": zip_path,
     }
 
-# 쇼츠메이커 CLOUD V3.0.1
-# Streamlit Cloud ImportError hotfix
-# shorts_engine 기능을 이 파일 안에 포함해 버전 불일치를 방지합니다.
+# 쇼츠메이커 CLOUD V3.1
+# 단일 파일 클라우드 버전
+# 외부 엔진 모듈을 불러오지 않아 GitHub 파일 버전 충돌을 방지합니다.
 
 import hashlib
 import json
@@ -1628,12 +1779,12 @@ from pathlib import Path
 import streamlit as st
 
 
-VERSION = "3.0.1"
-STATE_PLAN = "v30_plan"
-STATE_RESULT = "v30_result"
+VERSION = "3.1"
+STATE_PLAN = "v31_plan"
+STATE_RESULT = "v31_result"
 
 st.set_page_config(
-    page_title="쇼츠메이커 CLOUD V3.0.1",
+    page_title="쇼츠메이커 CLOUD V3.1",
     page_icon="🎬",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -1657,18 +1808,19 @@ st.markdown(
 @media (max-width: 700px) {.hero {padding:22px 20px}.hero h1 {font-size:1.65rem}.block-container {padding-left:.8rem; padding-right:.8rem}}
 </style>
 <div class="hero">
-  <h1>🎬 쇼츠메이커 CLOUD V3.0.1</h1>
+  <h1>🎬 쇼츠메이커 CLOUD V3.1</h1>
   <p>집 노트북·회사 PC·휴대폰에서 같은 웹주소로 접속해, 기사 기반 쇼츠를 제작하는 클라우드 버전입니다.</p>
   <div class="pills">
     <span class="pill">API 키 입력 없음</span>
     <span class="pill">개인 PC 서버 불필요</span>
+    <span class="pill">주목형 제목 자동 생성</span>
     <span class="pill">기사 사진 자동 사용 금지</span>
     <span class="pill">내 목소리 보정</span>
     <span class="pill">콘텐츠별 자동 BGM</span>
   </div>
 </div>
 <div class="cloudbox"><b>접속 방식</b><br>기존 Streamlit 웹주소 하나만 사용합니다. 집에서는 노트북, 회사에서는 회사 PC, 밖에서는 휴대폰으로 같은 주소를 열면 됩니다. 어느 기기도 서버 역할을 하지 않습니다.</div>
-<div class="safebox"><b>저작권 안전 기본값</b><br>기사 문장과 기사 사진을 그대로 가져오지 않습니다. 제목·핵심어·수치만 구조화해 새 해설 대본을 만들고, 화면은 프로그램이 직접 생성한 에디토리얼 그래픽으로 구성합니다.</div>
+<div class="safebox"><b>저작권 안전 기본값</b><br>기사 문장과 기사 사진을 그대로 가져오지 않습니다. 제목·핵심어·수치만 구조화해 새 해설 대본과 주목형 제목 후보를 만들고, 화면은 프로그램이 직접 생성한 에디토리얼 그래픽으로 구성합니다.</div>
 """,
     unsafe_allow_html=True,
 )
@@ -1696,6 +1848,7 @@ with st.expander("다른 기기에서 이어서 수정할 프로젝트 불러오
                 "plan": plan,
                 "category": payload.get("category", "연예"),
                 "duration": int(payload.get("duration", 45)),
+                "title_style": payload.get("title_style", "강한 후킹형 · 클릭 유도 추천"),
                 "engine": "무키 자체 해설 엔진",
             }
             st.session_state.pop(STATE_RESULT, None)
@@ -1719,7 +1872,14 @@ with c1:
 with c2:
     target_duration = st.selectbox("목표 길이", [30, 45, 60], index=1, format_func=lambda x: f"{x}초")
 
-make_plan = st.button("🧠 키 없이 새 해설 대본 만들기", type="primary", use_container_width=True)
+title_style = st.selectbox(
+    "영상 제목 스타일",
+    TITLE_STYLE_OPTIONS,
+    index=0,
+    help="기사에 없는 사실은 만들지 않고, 핵심어·수치·쟁점을 이용해 클릭을 부르는 제목 후보를 자동 생성합니다.",
+)
+
+make_plan = st.button("🧠 대본 + 주목형 제목 자동 만들기", type="primary", use_container_width=True)
 if make_plan:
     if not url.strip() and not manual_text.strip():
         st.error("기사 링크 또는 기사 본문을 입력해주세요.")
@@ -1757,7 +1917,7 @@ if make_plan:
             article.title = manual_title.strip()
 
         progress.progress(42, text="기사 문장이 아닌 핵심어와 수치를 분리했습니다.")
-        raw = generate_zero_key_plan(article, target_duration, category)
+        raw = generate_zero_key_plan(article, target_duration, category, title_style)
         plan = normalize_plan(raw, article, target_duration)
         progress.progress(100, text="대본이 준비됐습니다.")
         status.success(f"완료: 무키 자체 해설 엔진 · {len(plan['scenes'])}개 장면")
@@ -1766,9 +1926,12 @@ if make_plan:
             "plan": plan,
             "category": category,
             "duration": target_duration,
+            "title_style": title_style,
             "engine": "무키 자체 해설 엔진",
         }
         st.session_state.pop(STATE_RESULT, None)
+        st.session_state.pop("edit-title", None)
+        st.session_state.pop("edit-script", None)
     except ShortsMakerError as exc:
         progress.empty(); status.empty(); st.error(str(exc))
     except Exception as exc:
@@ -1780,19 +1943,52 @@ if plan_state:
     plan = plan_state["plan"]
     category = plan_state["category"]
     duration = int(plan_state["duration"])
+    active_title_style = plan_state.get("title_style", plan.get("title_style", "강한 후킹형 · 클릭 유도 추천"))
 
     st.divider()
-    st.markdown('<div class="step">2. 대본 확인·수정</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step">2. 주목형 제목 선택 + 대본 확인</div>', unsafe_allow_html=True)
     left, right = st.columns([1.15, 1])
     with left:
-        edited_title = st.text_input("영상 제목", value=plan["video_title"], key="edit-title")
+        st.markdown("**🔥 자동 생성된 제목 후보**")
+        title_candidates = plan.get("title_candidates") or [plan["video_title"]]
+        selected_candidate = st.selectbox(
+            "사람들이 누르고 싶게 만드는 제목 후보",
+            title_candidates,
+            index=title_candidates.index(plan["video_title"]) if plan["video_title"] in title_candidates else 0,
+            key="title-candidate",
+        )
+        tc1, tc2 = st.columns(2)
+        with tc1:
+            if st.button("✅ 선택한 제목 적용", use_container_width=True):
+                plan["video_title"] = selected_candidate
+                st.session_state[STATE_PLAN]["plan"] = plan
+                st.session_state["edit-title"] = selected_candidate
+                st.success("선택한 제목을 영상과 YouTube 업로드 정보에 적용했습니다.")
+                st.rerun()
+        with tc2:
+            if st.button("🔄 다른 스타일 제목 만들기", use_container_width=True):
+                style_index = TITLE_STYLE_OPTIONS.index(active_title_style) if active_title_style in TITLE_STYLE_OPTIONS else 0
+                next_style = TITLE_STYLE_OPTIONS[(style_index + 1) % len(TITLE_STYLE_OPTIONS)]
+                refreshed = generate_attention_titles(article, category, style=next_style)
+                plan["title_candidates"] = refreshed
+                plan["video_title"] = refreshed[0]
+                plan["title_style"] = next_style
+                st.session_state[STATE_PLAN]["title_style"] = next_style
+                st.session_state[STATE_PLAN]["plan"] = plan
+                st.session_state.pop("edit-title", None)
+                st.success(f"{next_style} 제목으로 다시 만들었습니다.")
+                st.rerun()
+        st.caption("허위·과장 표현은 제외하고, 기사에서 확인된 대상·수치·쟁점을 이용해 주목도를 높입니다.")
+        edited_title = st.text_input("최종 영상 제목 (직접 수정 가능)", value=plan["video_title"], key="edit-title")
         edited_script = st.text_area("읽을 전체 대본", value=plan["narration"], height=270, key="edit-script")
-        if st.button("✍️ 수정 대본을 장면에 적용", use_container_width=True):
+        if st.button("✍️ 최종 제목·수정 대본을 장면에 적용", use_container_width=True):
             try:
                 plan["video_title"] = edited_title.strip() or plan["video_title"]
+                if plan["video_title"] not in plan.get("title_candidates", []):
+                    plan.setdefault("title_candidates", []).insert(0, plan["video_title"])
                 plan = plan_from_edited_narration(plan, edited_script, article, duration)
                 st.session_state[STATE_PLAN]["plan"] = plan
-                st.success("수정한 문장 기준으로 자막과 장면을 다시 나눴습니다.")
+                st.success("최종 제목과 수정한 대본을 자막·장면에 적용했습니다.")
                 st.rerun()
             except ShortsMakerError as exc:
                 st.error(str(exc))
@@ -1811,11 +2007,12 @@ if plan_state:
             "plan": plan,
             "category": category,
             "duration": duration,
+            "title_style": active_title_style,
         }
         st.download_button(
             "💾 다른 기기용 프로젝트 저장",
             json.dumps(project_payload, ensure_ascii=False, indent=2).encode("utf-8"),
-            file_name="shorts_project_v30.json",
+            file_name="shorts_project_v31.json",
             mime="application/json",
             use_container_width=True,
         )
@@ -1892,7 +2089,7 @@ if plan_state:
         plan = plan_from_edited_narration(plan, edited_script, article, duration)
         st.session_state[STATE_PLAN]["plan"] = plan
 
-        workdir = Path(tempfile.mkdtemp(prefix="shortsmaker_cloud_v30_"))
+        workdir = Path(tempfile.mkdtemp(prefix="shortsmaker_cloud_v31_"))
         narration_path = None
         if source_audio is not None:
             suffix = Path(getattr(source_audio, "name", "voice.wav")).suffix or ".wav"
@@ -1960,16 +2157,16 @@ if result:
     with left:
         st.subheader("완성 영상")
         st.video(result["video"], format="video/mp4")
-        st.download_button("⬇️ 결과 전체 ZIP", result["zip"], "shorts_v30_result.zip", "application/zip", type="primary", use_container_width=True, key=f"zip-{result['key']}")
+        st.download_button("⬇️ 결과 전체 ZIP", result["zip"], "shorts_v31_result.zip", "application/zip", type="primary", use_container_width=True, key=f"zip-{result['key']}")
         d1, d2 = st.columns(2)
         with d1:
-            st.download_button("MP4 다운로드", result["video"], "final_short_v30.mp4", "video/mp4", use_container_width=True)
+            st.download_button("MP4 다운로드", result["video"], "final_short_v31.mp4", "video/mp4", use_container_width=True)
         with d2:
-            st.download_button("나레이션 다운로드", result["audio"], "narration_v30.mp3", "audio/mpeg", use_container_width=True)
+            st.download_button("나레이션 다운로드", result["audio"], "narration_v31.mp3", "audio/mpeg", use_container_width=True)
     with right:
         st.subheader("저작권 안전 점검")
         st.text(result["copyright_report"].decode("utf-8-sig", errors="replace"))
         st.download_button("점검 보고서", result["copyright_report"], "copyright_check_report.txt", "text/plain", use_container_width=True)
         st.download_button("AI 공개 안내", result["ai_disclosure"], "ai_disclosure.txt", "text/plain", use_container_width=True)
 
-st.caption("CLOUD V3.0은 API 키 없이 작동하는 자체 대본·그래픽 엔진을 사용합니다. 자동 검사는 위험을 줄이는 장치이며 최종 게시 전 사실관계와 음원 조건을 확인해야 합니다.")
+st.caption("CLOUD V3.1은 API 키 없이 작동하는 자체 대본·주목형 제목·그래픽 엔진을 사용합니다. 자동 검사는 위험을 줄이는 장치이며 최종 게시 전 사실관계와 음원 조건을 확인해야 합니다.")

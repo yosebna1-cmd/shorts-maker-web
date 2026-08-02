@@ -1,33 +1,6 @@
-쇼츠메이커 CLOUD V3.0 자체검사 결과
-검사일: 2026-08-03
-
-[코드]
-- streamlit_app.py 문법 검사: 통과
-- shorts_engine.py 문법 검사: 통과
-
-[대본]
-- 외부 API 키 없이 기사 제목/핵심어/수치 구조화: 통과
-- 30초용 6개 장면 계획 생성: 통과
-- 원문 연속 유사 표현 검사: 통과
-- 사용자 수정 대본 장면 재분할: 통과
-
-[영상]
-- 기사 사진 없이 자체 에디토리얼 그래픽 생성: 통과
-- 720×1280 H.264 영상 생성: 통과
-- 사용자 M4A 음성 입력 및 밝은 보정: 통과
-- 콘텐츠별 내장 오리지널 BGM 자동 선택/혼합: 통과
-- AAC 오디오 합성: 통과
-- MP4 faststart 출력: 통과
-
-[결과물]
-- final_short.mp4: 생성 확인
-- subtitles.srt: 생성 확인
-- vrew_script.txt: 생성 확인
-- youtube_metadata.txt: 생성 확인
-- copyright_check_report.txt: 생성 확인
-- 결과 ZIP: 생성 확인
-
-[미검증 범위]
-- 실제 사용자 Streamlit Community Cloud 계정에서의 재배포 클릭 과정
-- 개별 회사 보안망에서 Streamlit 주소 접속 가능 여부
-- 외부 AI 성우 서비스의 장기 가용성
+쇼츠메이커 CLOUD V3.1 검사 항목
+- Python 문법 검사
+- streamlit_app.py 단독 import 검사
+- 제목 후보 8개 생성 및 금지 과장어 필터 검사
+- 기존 shorts_engine.py 없이 실행되는 단일 파일 구조 검사
+- Streamlit 서버 기동 및 health endpoint 검사
