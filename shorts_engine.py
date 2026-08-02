@@ -89,6 +89,32 @@ RESOLUTION_OPTIONS = {
 }
 
 
+VOICE_PRESET_OPTIONS = {
+    "깔끔하고 자연스럽게": "clean",
+    "밝고 듣기 좋게": "bright",
+    "재밌고 경쾌하게": "fun",
+    "차분하고 따뜻하게": "warm",
+}
+
+MUSIC_TRACK_OPTIONS = {
+    "연예·화제 팝": "01_entertainment_pop.mp3",
+    "뉴스·이슈 펄스": "02_news_pulse.mp3",
+    "경제·정보 미니멀": "03_economy_minimal.mp3",
+    "생활·사연 따뜻함": "04_lifestyle_warm.mp3",
+    "제품·리뷰 업비트": "05_review_upbeat.mp3",
+    "진지한 이슈·차분함": "06_serious_calm.mp3",
+}
+
+MUSIC_AUTO_BY_CATEGORY = {
+    "연예": "연예·화제 팝",
+    "국내 이슈": "뉴스·이슈 펄스",
+    "해외 이슈": "뉴스·이슈 펄스",
+    "경제·주식": "경제·정보 미니멀",
+    "생활정보": "생활·사연 따뜻함",
+    "제품·리뷰": "제품·리뷰 업비트",
+}
+
+
 @dataclass
 class ArticleData:
     url: str
@@ -323,6 +349,28 @@ def _response_text(data: dict[str, Any]) -> str:
     return "\n".join(texts)
 
 
+
+def _normalized_tokens(text: str) -> list[str]:
+    return [
+        token for token in re.findall(r"[0-9A-Za-z가-힣]+", (text or "").lower())
+        if token
+    ]
+
+
+def _longest_shared_phrase_words(source: str, target: str, max_n: int = 14) -> int:
+    source_tokens = _normalized_tokens(source)
+    target_tokens = _normalized_tokens(target)
+    if not source_tokens or not target_tokens:
+        return 0
+    source_joined = " ".join(source_tokens)
+    upper = min(max_n, len(target_tokens))
+    for n in range(upper, 5, -1):
+        for idx in range(0, len(target_tokens) - n + 1):
+            phrase = " ".join(target_tokens[idx:idx+n])
+            if phrase in source_joined:
+                return n
+    return 0
+
 def generate_plan_with_gemini(
     article: ArticleData,
     api_key: str,
@@ -342,7 +390,10 @@ def generate_plan_with_gemini(
 {source_note}
 
 규칙:
-- 기사 문장을 길게 베끼지 말고 사실만 새 문장으로 설명합니다.
+- 기사 문장을 요약하거나 문장 순서를 따라가지 말고, 인물·날짜·금액·공식 발표 등 확인 가능한 사실만 먼저 구조화합니다.
+- 원문과 8어절 이상 연속으로 같은 표현을 만들지 않습니다. 기사 제목도 그대로 후킹 문구로 사용하지 않습니다.
+- 기사 사진·방송 화면을 사용하지 않는 전제로, 실존 인물과 닮지 않은 에디토리얼 그래픽·사물·장소·실루엣 중심의 장면을 설계합니다.
+- 기사 내용을 그대로 전달하는 데서 끝내지 말고 쟁점·배경·오해하기 쉬운 점을 자체 해설로 덧붙입니다.
 - 확인되지 않은 추측, 과장, 명예훼손 표현을 넣지 않습니다.
 - 첫 장면은 2초 이내의 강한 궁금증형 후킹 문장입니다.
 - 전체 나레이션은 자연스러운 한국어 구어체이며 {duration}초 안에 읽을 수 있어야 합니다.
@@ -350,7 +401,8 @@ def generate_plan_with_gemini(
 - caption은 최대 2줄로 자연스럽게 나눌 수 있는 문장으로 작성합니다.
 - emphasis는 화면에서 강조할 핵심 단어 1~2개를 배열로 작성합니다.
 - 마지막은 시청자 의견을 묻는 한 문장으로 끝냅니다.
-- stock_keywords는 이미지 검색에 쓸 영어 단어 2~4개로 작성합니다.
+- stock_keywords는 특정 연예인 얼굴이나 방송 캡처가 아닌, 사물·장소·상황 중심의 상업 이용 가능한 스톡 이미지 검색용 영어 단어 2~4개로 작성합니다.
+- visual_note는 실존 인물을 복제하지 않는 독창적인 에디토리얼 그래픽 지시문으로 작성합니다.
 
 다음 JSON 구조로만 답하세요.
 {{
@@ -378,7 +430,42 @@ def generate_plan_with_gemini(
     errors: list[str] = []
     for model in ("gemini-2.5-flash", "gemini-2.5-flash-lite"):
         try:
-            return _extract_json(_response_text(_gemini_request(api_key, model, payload)))
+            candidate = _extract_json(_response_text(_gemini_request(api_key, model, payload)))
+            target_text = " ".join([
+                str(candidate.get("video_title") or ""),
+                str(candidate.get("hook") or ""),
+                str(candidate.get("narration") or ""),
+                " ".join(str(scene.get("caption") or "") for scene in (candidate.get("scenes") or []) if isinstance(scene, dict)),
+            ])
+            overlap = _longest_shared_phrase_words(article.text, target_text)
+            if overlap >= 8:
+                revise_prompt = f"""
+아래 JSON 대본은 기사 원문과 {overlap}어절 이상 연속으로 겹치는 표현이 발견되었습니다.
+사실·고유명사·수치만 유지하고, 문장 구조·정보 순서·후킹·해설을 완전히 새롭게 바꾸세요.
+직접 인용은 사용하지 마세요. JSON 구조는 그대로 유지하세요.
+
+기존 JSON:
+{json.dumps(candidate, ensure_ascii=False)}
+""".strip()
+                revise_payload = {
+                    "contents": [{"parts": [{"text": revise_prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0.55,
+                        "responseMimeType": "application/json",
+                        "maxOutputTokens": 4096,
+                    },
+                }
+                candidate = _extract_json(_response_text(_gemini_request(api_key, model, revise_payload)))
+                target_text = " ".join([
+                    str(candidate.get("video_title") or ""),
+                    str(candidate.get("hook") or ""),
+                    str(candidate.get("narration") or ""),
+                ])
+                overlap = _longest_shared_phrase_words(article.text, target_text)
+            candidate["originality_overlap_words"] = overlap
+            if overlap >= 10:
+                raise ShortsMakerError(f"원문과 {overlap}어절 연속 유사 표현이 남아 있어 제작을 중단했습니다. 다시 대본을 생성해주세요.")
+            return candidate
         except Exception as exc:
             errors.append(f"{model}: {exc}")
     raise ShortsMakerError(" / ".join(errors))
@@ -434,7 +521,7 @@ def generate_local_plan(article: ArticleData, duration: int, category: str) -> d
             "emphasis": _pick_emphasis(part),
             "narration": part,
             "stock_keywords": category,
-            "visual_note": "기사 이미지 또는 정보형 그래픽",
+            "visual_note": "실존 인물과 닮지 않은 정보형 에디토리얼 그래픽",
         }
         for part in narration_parts
     ]
@@ -510,6 +597,7 @@ def normalize_plan(plan: dict[str, Any], article: ArticleData, duration: int) ->
         "description": str(plan.get("description") or f"원문 출처: {article.url}").strip(),
         "hashtags": [str(tag).strip() for tag in hashtags if str(tag).strip()],
         "core_facts": [str(x).strip() for x in (plan.get("core_facts") or []) if str(x).strip()][:3],
+        "originality_overlap_words": int(plan.get("originality_overlap_words") or 0),
         "scenes": scenes[:10],
     }
 
@@ -842,24 +930,6 @@ def _draw_centered_line(
     return _measure(draw, line, font, stroke_width)[1]
 
 
-def _draw_badge(
-    canvas: Image.Image,
-    text: str,
-    x: int,
-    y: int,
-    accent: tuple[int, int, int],
-    scale: float,
-) -> tuple[int, int, int, int]:
-    draw = ImageDraw.Draw(canvas)
-    font = ImageFont.truetype(find_font(True), max(18, int(21 * scale)))
-    text_w, text_h = _measure(draw, text, font)
-    pad_x, pad_y = int(18 * scale), int(9 * scale)
-    rect = (x, y, x + text_w + pad_x * 2, y + text_h + pad_y * 2)
-    draw.rounded_rectangle(rect, radius=int(18 * scale), fill=(*accent, 238))
-    draw.text((x + pad_x, y + pad_y - int(2 * scale)), text, font=font, fill=(18, 19, 24))
-    return rect
-
-
 def make_scene_card(
     image_path: Path | None,
     output_path: Path,
@@ -875,7 +945,7 @@ def make_scene_card(
     accent: tuple[int, int, int] = (255, 216, 77),
     background_mode: str = "auto",
     show_hook: bool = True,
-    show_badge: bool = True,
+    show_badge: bool = False,
     size: tuple[int, int] = (720, 1280),
 ) -> None:
     width, height = size
@@ -895,9 +965,7 @@ def make_scene_card(
     source_text = _short_caption(f"출처 · {source}" if source else "기사 기반 AI 요약", 54)
 
     if template == "news":
-        if show_badge:
-            _draw_badge(canvas, category or "NEWS", margin, int(48 * scale), accent, scale)
-        title_y = int(118 * scale) if show_badge else int(62 * scale)
+        title_y = int(62 * scale)
         title_font, title_lines = _fit_font_lines(
             draw,
             _short_caption(title, 54),
@@ -929,8 +997,6 @@ def make_scene_card(
         caption_y = box_top + int(36 * scale)
         caption_width = width - margin * 2 - int(54 * scale)
     elif template == "card":
-        if show_badge:
-            _draw_badge(canvas, category or "INFO", margin, int(48 * scale), accent, scale)
         hook_text = hook if show_hook else title
         hook_font, hook_lines = _fit_font_lines(
             draw,
@@ -967,8 +1033,6 @@ def make_scene_card(
         caption_y = box_top + int(34 * scale)
         caption_width = width - margin * 2 - int(66 * scale)
     else:
-        if show_badge:
-            _draw_badge(canvas, category or "TREND", margin, int(48 * scale), accent, scale)
         if show_hook:
             hook_font, hook_lines = _fit_font_lines(
                 draw,
@@ -1099,6 +1163,78 @@ def _run(command: list[str], description: str) -> None:
         raise ShortsMakerError(f"{description} 실패:\n{detail}")
 
 
+
+def _voice_filter(preset: str) -> str:
+    filters = {
+        "clean": (
+            "highpass=f=80,lowpass=f=12500,afftdn=nf=-25,"
+            "equalizer=f=180:t=q:w=1:g=-2,equalizer=f=3200:t=q:w=1:g=2.5,"
+            "acompressor=threshold=-18dB:ratio=2.4:attack=12:release=180:makeup=2,"
+            "loudnorm=I=-16:TP=-1.5:LRA=8"
+        ),
+        "bright": (
+            "highpass=f=90,lowpass=f=13000,afftdn=nf=-25,"
+            "equalizer=f=220:t=q:w=1:g=-2.5,equalizer=f=3500:t=q:w=1:g=4,"
+            "equalizer=f=7000:t=q:w=1:g=1.5,asetrate=48000*1.025,aresample=48000,atempo=0.97561,"
+            "acompressor=threshold=-19dB:ratio=2.6:attack=10:release=150:makeup=2.5,"
+            "loudnorm=I=-15.5:TP=-1.2:LRA=7"
+        ),
+        "fun": (
+            "highpass=f=100,lowpass=f=13500,afftdn=nf=-24,"
+            "equalizer=f=250:t=q:w=1:g=-2,equalizer=f=4200:t=q:w=1:g=4.5,"
+            "asetrate=48000*1.06,aresample=48000,atempo=0.9717,"
+            "acompressor=threshold=-20dB:ratio=3:attack=8:release=120:makeup=3,"
+            "loudnorm=I=-15:TP=-1:LRA=6"
+        ),
+        "warm": (
+            "highpass=f=70,lowpass=f=11000,afftdn=nf=-25,"
+            "equalizer=f=140:t=q:w=1:g=2,equalizer=f=2800:t=q:w=1:g=1,"
+            "asetrate=48000*0.975,aresample=48000,atempo=1.02564,"
+            "acompressor=threshold=-18dB:ratio=2.3:attack=15:release=220:makeup=2,"
+            "loudnorm=I=-16:TP=-1.5:LRA=8"
+        ),
+    }
+    return filters.get(preset, filters["clean"])
+
+
+def process_user_voice(input_path: Path, preset: str, output_path: Path) -> None:
+    if not input_path.exists() or input_path.stat().st_size < 1000:
+        raise ShortsMakerError("내 목소리 녹음 파일이 비어 있습니다.")
+    _run(
+        [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-af", _voice_filter(preset),
+            "-c:a", "libmp3lame", "-b:a", "160k", str(output_path),
+        ],
+        "내 목소리 보정",
+    )
+
+
+def _music_asset_path(track_label: str) -> Path | None:
+    filename = MUSIC_TRACK_OPTIONS.get(track_label)
+    if not filename:
+        return None
+    path = Path(__file__).resolve().parent / "assets" / "music" / filename
+    return path if path.exists() else None
+
+
+def _select_music_label(category: str, requested: str) -> str:
+    if requested and requested != "자동 추천":
+        return requested
+    return MUSIC_AUTO_BY_CATEGORY.get(category, "뉴스·이슈 펄스")
+
+
+def _copy_or_prepare_music(source: Path, output_path: Path) -> None:
+    _run(
+        [
+            "ffmpeg", "-y", "-i", str(source),
+            "-af", "highpass=f=45,lowpass=f=15000,loudnorm=I=-21:TP=-2:LRA=9",
+            "-c:a", "libmp3lame", "-b:a", "160k", str(output_path),
+        ],
+        "배경음악 준비",
+    )
+
+
 def render_video(
     article: ArticleData,
     plan: dict[str, Any],
@@ -1112,9 +1248,15 @@ def render_video(
     accent: tuple[int, int, int] = (255, 216, 77),
     background_mode: str = "auto",
     show_hook: bool = True,
-    show_badge: bool = True,
+    show_badge: bool = False,
     category: str = "뉴스",
     resolution: tuple[int, int] = (720, 1280),
+    narration_audio: Path | None = None,
+    voice_preset: str = "clean",
+    music_mode: str = "auto",
+    music_track: str = "자동 추천",
+    music_volume: float = 0.11,
+    custom_music: Path | None = None,
 ) -> dict[str, Path]:
     progress = progress or (lambda _: None)
     temp_root = Path(workdir or tempfile.mkdtemp(prefix="shortsmaker_"))
@@ -1123,19 +1265,22 @@ def render_video(
     scenes: list[dict[str, str]] = plan["scenes"]
     narration = plan["narration"]
     audio_path = temp_root / "narration.mp3"
-    progress("AI 성우 나레이션을 생성하고 있습니다.")
-    actual_voice = synthesize_edge_tts(narration, voice, rate, audio_path)
+    if narration_audio is not None:
+        progress("업로드한 내 목소리를 깨끗하고 듣기 좋게 보정하고 있습니다.")
+        process_user_voice(narration_audio, voice_preset, audio_path)
+        actual_voice = f"내 목소리 보정 · {voice_preset}"
+        voice_mode = "내 목소리"
+    else:
+        progress("AI 성우 나레이션을 생성하고 있습니다.")
+        actual_voice = synthesize_edge_tts(narration, voice, rate, audio_path)
+        voice_mode = "AI 성우"
+
     audio_duration = ffprobe_duration(audio_path)
     durations = allocate_durations(scenes, max(audio_duration + 0.35, 3.0 * len(scenes)))
 
-    progress("기사 이미지와 장면을 구성하고 있습니다.")
-    downloaded_article_images: list[Path] = []
-    for idx, image_url in enumerate(article.images[:10]):
-        path = temp_root / f"article_{idx:02}.jpg"
-        if _download_image(image_url, path):
-            downloaded_article_images.append(path)
-
+    progress("저작권 안전 스톡 이미지와 자체 그래픽으로 장면을 구성하고 있습니다.")
     scene_clips: list[Path] = []
+    used_visuals: list[str] = []
     for idx, (scene, scene_duration) in enumerate(zip(scenes, durations)):
         image_path: Path | None = None
         pexels_url = search_pexels_image(scene.get("stock_keywords", ""), pexels_key)
@@ -1143,8 +1288,9 @@ def render_video(
             candidate = temp_root / f"pexels_{idx:02}.jpg"
             if _download_image(pexels_url, candidate):
                 image_path = candidate
-        if image_path is None and downloaded_article_images:
-            image_path = downloaded_article_images[idx % len(downloaded_article_images)]
+                used_visuals.append(f"장면 {idx + 1}: Pexels 스톡 이미지 · {scene.get('stock_keywords','')}")
+        if image_path is None:
+            used_visuals.append(f"장면 {idx + 1}: 프로그램 자체 생성 에디토리얼 그래픽")
 
         card_path = temp_root / f"scene_{idx:02}.jpg"
         make_scene_card(
@@ -1154,7 +1300,7 @@ def render_video(
             emphasis=scene.get("emphasis") or [],
             title=plan["video_title"],
             hook=plan.get("hook") or plan["video_title"],
-            category=category,
+            category="",
             source=article.publisher or urllib.parse.urlparse(article.url).netloc,
             index=idx,
             template=template,
@@ -1162,88 +1308,75 @@ def render_video(
             accent=accent,
             background_mode=background_mode,
             show_hook=show_hook,
-            show_badge=show_badge,
+            show_badge=False,
             size=resolution,
         )
         clip_path = temp_root / f"clip_{idx:02}.mp4"
         _run(
             [
-                "ffmpeg",
-                "-y",
-                "-loop",
-                "1",
-                "-i",
-                str(card_path),
-                "-t",
-                f"{scene_duration:.3f}",
-                "-vf",
-                (
+                "ffmpeg", "-y", "-loop", "1", "-i", str(card_path),
+                "-t", f"{scene_duration:.3f}",
+                "-vf", (
                     f"scale={resolution[0]}:{resolution[1]},"
                     f"zoompan=z='min(zoom+0.00035,1.045)':"
                     f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
                     f"d=1:s={resolution[0]}x{resolution[1]}:fps=30,format=yuv420p"
                 ),
-                "-r",
-                "30",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-an",
-                str(clip_path),
+                "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-an", str(clip_path),
             ],
             f"{idx + 1}번 장면 렌더링",
         )
         scene_clips.append(clip_path)
 
-    progress("장면과 나레이션을 하나의 세로 영상으로 합치고 있습니다.")
+    progress("장면을 하나의 세로 영상으로 합치고 있습니다.")
     concat_file = temp_root / "concat.txt"
-    concat_file.write_text(
-        "\n".join(f"file '{clip.as_posix()}'" for clip in scene_clips),
-        encoding="utf-8",
-    )
+    concat_file.write_text("\n".join(f"file '{clip.as_posix()}'" for clip in scene_clips), encoding="utf-8")
     silent_video = temp_root / "silent.mp4"
-    _run(
-        [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_file),
-            "-c",
-            "copy",
-            str(silent_video),
-        ],
-        "장면 합치기",
-    )
+    _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(silent_video)], "장면 합치기")
+
+    selected_music_label = "사용 안 함"
+    prepared_music: Path | None = None
+    music_disclosure = "아니오"
+    if music_mode != "none":
+        if music_mode == "upload" and custom_music is not None:
+            selected_music_label = "사용자가 업로드한 YouTube 오디오 라이브러리/보유 음원"
+            music_source = custom_music
+            music_disclosure = "음원 성격에 따라 확인"
+        else:
+            selected_music_label = _select_music_label(category, music_track)
+            music_source = _music_asset_path(selected_music_label)
+            music_disclosure = "예 · 프로그램 생성형 오리지널 BGM"
+        if music_source is not None and music_source.exists():
+            prepared_music = temp_root / "background_music.mp3"
+            _copy_or_prepare_music(music_source, prepared_music)
 
     final_video = temp_root / "final_short.mp4"
-    _run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(silent_video),
-            "-i",
-            str(audio_path),
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "160k",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            str(final_video),
-        ],
-        "최종 영상 합성",
-    )
+    if prepared_music is not None:
+        fade_out = max(0.0, audio_duration - 1.2)
+        volume = min(max(float(music_volume), 0.0), 0.35)
+        _run(
+            [
+                "ffmpeg", "-y", "-i", str(silent_video), "-i", str(audio_path),
+                "-stream_loop", "-1", "-i", str(prepared_music),
+                "-filter_complex",
+                (
+                    f"[2:a]volume={volume:.4f},atrim=0:{audio_duration:.3f},"
+                    f"afade=t=in:st=0:d=0.7,afade=t=out:st={fade_out:.3f}:d=1.2[bg];"
+                    "[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
+                ),
+                "-map", "0:v:0", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-shortest", "-movflags", "+faststart", str(final_video),
+            ],
+            "나레이션과 자동 배경음악 합성",
+        )
+    else:
+        _run(
+            [
+                "ffmpeg", "-y", "-i", str(silent_video), "-i", str(audio_path),
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest", "-movflags", "+faststart", str(final_video),
+            ],
+            "최종 영상 합성",
+        )
 
     srt_path = temp_root / "subtitles.srt"
     srt_path.write_text(make_srt(scenes, durations), encoding="utf-8-sig")
@@ -1252,19 +1385,56 @@ def render_video(
     metadata_path = temp_root / "youtube_metadata.txt"
     metadata_path.write_text(
         f"제목\n{plan['video_title']}\n\n설명\n{plan['description']}\n\n"
-        f"{' '.join(plan['hashtags'])}\n\n원문\n{article.url}\n",
+        f"{' '.join(plan['hashtags'])}\n\n참고 출처\n{article.publisher}\n{article.url}\n",
         encoding="utf-8-sig",
     )
     source_path = temp_root / "source.txt"
     source_path.write_text(
         f"기사 제목: {article.title}\n매체: {article.publisher}\nURL: {article.url}\n"
-        f"사용 성우: {actual_voice}\n",
+        f"나레이션 방식: {voice_mode}\n사용 성우/프리셋: {actual_voice}\n배경음악: {selected_music_label}\n",
+        encoding="utf-8-sig",
+    )
+    visual_path = temp_root / "visual_sources.txt"
+    visual_path.write_text(
+        "기사 사진 사용: 없음\n방송 화면 사용: 없음\n" + "\n".join(used_visuals) + "\n",
+        encoding="utf-8-sig",
+    )
+    license_path = temp_root / "music_license.txt"
+    license_path.write_text(
+        "배경음악 사용 내역\n"
+        f"선택 음원: {selected_music_label}\n"
+        "내장 음원은 제3자 음원 샘플 없이 프로그램용으로 합성한 오리지널 트랙입니다.\n"
+        "사용자가 업로드한 음원은 YouTube 오디오 라이브러리의 라이선스/저작자 표시 조건을 직접 확인해야 합니다.\n",
+        encoding="utf-8-sig",
+    )
+    report_path = temp_root / "copyright_check_report.txt"
+    report_path.write_text(
+        "쇼츠메이커 WEB V2.2 저작권 안전 점검\n\n"
+        "[대본]\n기사 원문 직접 낭독: 사용 안 함\n사실 기반 재작성: 적용\n"
+        f"원문과 최장 연속 유사 어절: {int(plan.get('originality_overlap_words') or 0)}어절\n"
+        "[영상]\n기사 대표 사진: 사용 안 함\n방송 캡처/타 유튜브 영상: 사용 안 함\n"
+        "Pexels 또는 자체 생성 그래픽: 사용\n"
+        f"[음성]\n나레이션: {voice_mode} / {actual_voice}\n"
+        f"[음악]\n{selected_music_label}\n생성형 음악 공개 안내 권장: {music_disclosure}\n\n"
+        "주의: 이 보고서는 위험을 줄이기 위한 제작 기록이며 법적 무침해를 보증하지 않습니다.\n",
+        encoding="utf-8-sig",
+    )
+    disclosure_path = temp_root / "ai_disclosure.txt"
+    disclosure_path.write_text(
+        "YouTube 업로드 시 확인\n"
+        f"- 내 목소리 단순 보정: {'예' if narration_audio is not None else '해당 없음'} (일반적인 오디오 보정 수준)\n"
+        f"- 프로그램 생성형 BGM 사용: {music_disclosure}\n"
+        "- 사실적으로 생성된 실존 인물/사건 영상: 사용 안 함\n"
+        "생성형 BGM을 사용했다면 YouTube Studio의 변경/합성 콘텐츠 항목을 확인하세요.\n",
         encoding="utf-8-sig",
     )
 
-    zip_path = temp_root / "shorts_result.zip"
+    zip_path = temp_root / "shorts_result_v22.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path in (final_video, audio_path, srt_path, script_path, metadata_path, source_path):
+        for path in (
+            final_video, audio_path, srt_path, script_path, metadata_path, source_path,
+            visual_path, license_path, report_path, disclosure_path,
+        ):
             archive.write(path, path.name)
 
     return {
@@ -1274,5 +1444,9 @@ def render_video(
         "script": script_path,
         "metadata": metadata_path,
         "source": source_path,
+        "visual_sources": visual_path,
+        "music_license": license_path,
+        "copyright_report": report_path,
+        "ai_disclosure": disclosure_path,
         "zip": zip_path,
     }

@@ -1,4 +1,4 @@
-streamlit>=1.47,<2
+streamlit>=1.48,<2
 requests>=2.32,<3
 beautifulsoup4>=4.13,<5
 trafilatura>=2.0,<3
