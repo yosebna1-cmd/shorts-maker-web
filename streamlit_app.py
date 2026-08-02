@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -55,6 +56,7 @@ VOICE_OPTIONS: dict[str, dict[str, str]] = {
 RATE_OPTIONS = {
     "보통": "+0%",
     "조금 빠르게": "+8%",
+    "시그니처 추천": "+13%",
     "쇼츠 추천": "+15%",
     "매우 빠르게": "+22%",
 }
@@ -116,7 +118,8 @@ MUSIC_AUTO_BY_CATEGORY = {
 }
 
 TITLE_STYLE_OPTIONS = [
-    "강한 후킹형 · 클릭 유도 추천",
+    "초강력 후킹형 · 사실 기반 자극형",
+    "강한 후킹형 · 클릭 유도",
     "균형형 · 주목도와 신뢰감",
     "정보형 · 과장 최소화",
 ]
@@ -557,33 +560,95 @@ def _category_context(category: str) -> str:
 
 
 
+def _strip_korean_josa(token: str) -> str:
+    token = re.sub(r"[\"'“”‘’()\[\]{}]", "", token or "").strip()
+    for josa in ("에게서는", "으로부터", "에서는", "에게서", "한테서", "으로는", "로서는", "까지는", "부터는", "이라는", "라는", "에게", "한테", "께서", "으로", "에서", "부터", "까지", "처럼", "보다", "하고", "이며", "이나", "거나", "은", "는", "이", "가", "을", "를", "의", "도", "만", "와", "과", "로"):
+        if len(token) >= len(josa) + 2 and token.endswith(josa):
+            token = token[:-len(josa)]
+            break
+    return token.strip()
+
+
 def _title_subject(title: str, keywords: list[str]) -> str:
-    """기사 제목의 첫 핵심 구절을 우선 사용해 대상이 어색하게 쪼개지지 않도록 한다."""
+    """'이탁수는 배우'처럼 조사·직업이 붙은 구절에서 실제 핵심 인물만 추출한다."""
     clean_title = _clean_article_title(title)
     clean_title = re.sub(r"^\s*\[[^\]]{1,20}\]\s*", "", clean_title)
     clean_title = re.sub(r"^\s*[【〔(][^】〕)]{1,20}[】〕)]\s*", "", clean_title)
     clean_title = re.sub(r"[\r\n]+", " ", clean_title).strip()
 
-    # 연예 기사 제목은 대개 첫 쉼표/말줄임표 앞에 인물·작품명이 온다.
-    first_clause = re.split(r"\s*(?:,|…|\.{2,}|｜|\||:)\s*", clean_title, maxsplit=1)[0]
+    first_clause = re.split(r"\s*(?:,|…|\.{2,}|｜|\||:|=)\s*", clean_title, maxsplit=1)[0]
     first_clause = re.sub(r"^[\"'“”‘’]+|[\"'“”‘’]+$", "", first_clause).strip()
     first_clause = re.sub(r"\s+", " ", first_clause)
-    generic_only = {"단독", "공식", "종합", "이슈", "연예", "뉴스", "오늘", "속보"}
-    if 2 <= len(first_clause) <= 28 and first_clause not in generic_only:
-        return _short_caption(first_clause, 28)
 
-    preferred = [
-        word for word in keywords
-        if not re.fullmatch(r"\d+(?:[.,]\d+)?%?", word)
-        and word not in generic_only
-    ]
+    # '이탁수는 배우', '홍길동 배우', '김OO의 아들' 같은 문구에서 이름 우선 추출
+    name_match = re.match(
+        r"^([가-힣]{2,4}?)(?:은|는|이|가|도|만|의)?(?:\s+)(?:배우|가수|방송인|모델|연예인|개그맨|코미디언|아들|딸|부친|모친|남편|아내)(?:\b|\s|$)",
+        first_clause,
+    )
+    if name_match:
+        return name_match.group(1)
+
+    parts = first_clause.split()
+    if parts:
+        first = _strip_korean_josa(parts[0])
+        if re.fullmatch(r"[가-힣]{2,4}", first):
+            return first
+
+    generic_only = {"단독", "공식", "종합", "이슈", "연예", "뉴스", "오늘", "속보", "배우", "가수", "방송인"}
+    preferred = []
+    for word in keywords:
+        clean = _strip_korean_josa(word)
+        if re.fullmatch(r"\d+(?:[.,]\d+)?%?", clean) or clean in generic_only:
+            continue
+        preferred.append(clean)
     if preferred:
-        subject = " ".join(preferred[:2])
+        subject = preferred[0]
     else:
-        subject = _short_caption(clean_title, 26)
+        subject = _short_caption(clean_title, 20)
     subject = re.sub(r"\s+", " ", subject).strip(" -|｜·,:;")
-    return _short_caption(subject or "오늘의 이슈", 28)
+    return _short_caption(subject or "오늘의 이슈", 20)
 
+
+def _detect_title_event(title: str, body: str, category: str) -> str:
+    source = f"{title} {body}"
+    patterns = [
+        (r"배우\s*(?:데뷔|변신|도전)|연기\s*(?:데뷔|도전)|배우로\s*(?:데뷔|변신)", "배우 변신"),
+        (r"컴백|신곡|앨범|음원\s*공개", "컴백 소식"),
+        (r"캐스팅|출연\s*확정|합류", "출연 소식"),
+        (r"열애|연애|결혼", "열애·결혼 소식"),
+        (r"이혼|결별|파경", "결별 소식"),
+        (r"입대|군입대|전역", "군 복무 근황"),
+        (r"복귀|활동\s*재개", "복귀 소식"),
+        (r"해명|반박|입장문|공식\s*입장", "공식 입장"),
+        (r"사과|사과문", "사과 내용"),
+        (r"논란|의혹|갑론을박", "논란의 핵심"),
+        (r"수상|대상|1위", "뜻밖의 결과"),
+        (r"급등|급락|상한가|하한가", "가격 급변"),
+        (r"실적|매출|영업이익", "실적 발표"),
+        (r"출시|공개|발표", "새 발표"),
+    ]
+    for pattern, label in patterns:
+        if re.search(pattern, source, flags=re.I):
+            return label
+    if category == "연예":
+        return "새 근황"
+    if category == "경제·주식":
+        return "숫자 뒤의 배경"
+    if category == "제품·리뷰":
+        return "실사용 핵심"
+    return "이번 소식"
+
+
+def _headline_keyword(title: str, body: str) -> str:
+    source = f"{title} {body}"
+    candidates = [
+        "배우", "컴백", "결혼", "열애", "이혼", "복귀", "출연", "캐스팅", "입대", "전역",
+        "해명", "반박", "사과", "논란", "의혹", "1위", "급등", "급락", "출시", "발표",
+    ]
+    for keyword in candidates:
+        if keyword in source:
+            return keyword
+    return "근황"
 
 def _impactful_title_numbers(numbers: list[str]) -> list[str]:
     """날짜처럼 클릭 제목에서 의미가 약한 숫자를 빼고 금액·비율·순위 등만 남긴다."""
@@ -604,28 +669,35 @@ def _impactful_title_numbers(numbers: list[str]) -> list[str]:
 def _title_score(title: str, subject: str, numbers: list[str], style: str) -> int:
     score = 0
     length = len(title)
-    if 17 <= length <= 34:
-        score += 25
-    elif 13 <= length <= 40:
-        score += 14
+    if 20 <= length <= 39:
+        score += 30
+    elif 16 <= length <= 44:
+        score += 18
     else:
-        score -= abs(length - 27)
-    if subject and subject.split(" · ")[0] in title:
-        score += 12
+        score -= abs(length - 29)
+    if subject and subject in title:
+        score += 18
     if any(number in title for number in numbers):
-        score += 10
-    for phrase in ("주목하는 이유", "핵심은 따로", "결정적 포인트", "놓치면 안 될", "확인된 사실", "진짜 이유", "한 가지"):
+        score += 9
+    for phrase in (
+        "도대체 무슨 일", "관심 쏠린 이유", "다시 보게 된 이유", "진짜 포인트", "한마디에",
+        "전혀 다른 근황", "갑자기", "결국", "왜 다들", "이유는", "무슨 일이",
+    ):
         if phrase in title:
-            score += 7
-    if "?" in title or "…" in title:
-        score += 3
-    if style.startswith("강한"):
-        score += sum(3 for phrase in ("진짜 이유", "핵심은 따로", "결정적", "이것") if phrase in title)
+            score += 8
+    if "…" in title:
+        score += 7
+    if "?" in title:
+        score += 5
+    if "초강력" in style:
+        score += sum(5 for phrase in ("…", "?", "갑자기", "왜", "도대체", "결국") if phrase in title)
     elif style.startswith("정보형"):
         score += sum(4 for phrase in ("핵심 정리", "확인된 사실", "30초") if phrase in title)
-        score -= sum(3 for phrase in ("진짜 이유", "결정적") if phrase in title)
+        score -= sum(4 for phrase in ("도대체", "갑자기", "결국") if phrase in title)
     if any(word in title for word in TITLE_BANNED_WORDS):
-        score -= 50
+        score -= 80
+    if re.search(r"(?:는|은|이|가)\s+(?:배우|가수|방송인)(?:,|$)", title):
+        score -= 45
     return score
 
 
@@ -634,24 +706,36 @@ def generate_attention_titles(
     category: str,
     keywords: list[str] | None = None,
     numbers: list[str] | None = None,
-    style: str = "강한 후킹형 · 클릭 유도 추천",
+    style: str = "초강력 후킹형 · 사실 기반 자극형",
 ) -> list[str]:
-    """확인된 핵심 대상과 쟁점만 이용해 강하지만 허위가 없는 제목 후보를 만든다."""
+    """원문에 없는 사건은 만들지 않되, 질문·대조·말줄임표를 이용해 강한 클릭 제목을 만든다."""
     clean_title = _clean_article_title(article.title)
     body = re.sub(r"\s+", " ", article.text or "").strip()
-    keywords = keywords or _top_keywords(body, clean_title, 8)
+    keywords = keywords or _top_keywords(body, clean_title, 10)
     numbers = numbers or _extract_numbers(body, 4)
     title_numbers = _impactful_title_numbers(numbers)
     subject = _title_subject(clean_title, keywords)
+    event = _detect_title_event(clean_title, body, category)
+    headline_word = _headline_keyword(clean_title, body)
     source_text = f"{clean_title} {body}"
 
+    ultra = [
+        f"{subject}, 갑자기 {event}? 지금 관심 쏠린 이유",
+        f"“정말 {headline_word}?” {subject} 근황에 시선 쏠린 이유",
+        f"{subject}, {event}…도대체 무슨 일이 있었나",
+        f"{subject}, 모두가 다시 보게 된 진짜 포인트",
+        f"{subject} 근황, 기사 한 줄만 보면 놓치는 반전",
+        f"{subject}, ‘{headline_word}’ 한마디에 분위기가 달라졌다",
+        f"왜 다들 {subject}를 다시 검색할까? 핵심은 이것",
+        f"{subject}, 알려진 모습과 전혀 다른 새 근황",
+    ]
     strong = [
-        f"{subject}, 지금 반응이 쏟아지는 이유",
-        f"{subject}, 모두가 놓친 핵심은 따로 있었다",
-        f"{subject}, 이 소식이 갑자기 커진 이유",
-        f"{subject}, 알려진 내용보다 중요한 한 가지",
-        f"{subject}, 지금 꼭 확인해야 할 결정적 포인트",
-        f"{subject}, 사람들이 가장 궁금해한 건 이것",
+        f"{subject}, {event} 뒤에 숨은 진짜 포인트",
+        f"{subject}, 지금 관심이 쏠린 결정적 이유",
+        f"{subject} 근황, 모두가 놓친 한 가지",
+        f"{subject}, 기사 제목보다 중요한 핵심은 따로 있었다",
+        f"{subject}, 왜 다시 주목받고 있을까?",
+        f"{subject}, 지금 꼭 확인해야 할 변화",
     ]
     balanced = [
         f"{subject}, 사람들이 주목하는 이유를 정리했습니다",
@@ -670,54 +754,50 @@ def generate_attention_titles(
         f"{subject}, 기사 핵심만 빠르게 정리",
     ]
 
-    candidates = list(strong if style.startswith("강한") else factual if style.startswith("정보형") else balanced)
+    if "초강력" in style:
+        candidates = list(ultra)
+    elif style.startswith("강한"):
+        candidates = list(strong)
+    elif style.startswith("정보형"):
+        candidates = list(factual)
+    else:
+        candidates = list(balanced)
 
     if title_numbers:
         number = title_numbers[0]
-        candidates.extend([
-            f"{subject}, {number}보다 더 중요한 핵심",
-            f"{number}까지 언급된 {subject}, 꼭 볼 부분",
-        ])
+        candidates = [
+            f"{subject}, {number}까지…숫자보다 더 놀라운 핵심",
+            f"{number} 언급된 {subject}, 도대체 무슨 일?",
+            *candidates,
+        ]
     if re.search(r"논란|의혹|갑론을박|비판|갈등", source_text):
         candidates = [
-            f"{subject} 논란, 일이 커진 결정적 이유",
-            f"{subject} 의혹, 사실과 추측을 나눠 봤습니다",
+            f"{subject} 논란, 결국 사람들이 따지는 핵심은 이것",
+            f"{subject} 의혹…확인된 사실은 어디까지일까?",
             *candidates,
         ]
     if re.search(r"해명|반박|사과|입장", source_text):
-        candidates.insert(0, f"{subject}, 공식 입장에서 놓치면 안 될 부분")
-    if re.search(r"결혼|열애|이혼|결별|복귀|컴백|출연|캐스팅", source_text):
-        candidates.insert(0, f"{subject}, 갑자기 관심이 집중된 이유")
+        candidates.insert(0, f"{subject}, 공식 입장 한마디에 분위기 달라졌다")
+    if re.search(r"결혼|열애|이혼|결별|복귀|컴백|출연|캐스팅|데뷔", source_text):
+        candidates.insert(0, f"{subject}, 갑자기 {event}? 사람들이 놀란 이유")
     if re.search(r"급등|급락|상승|하락|주가|실적", source_text):
-        candidates = [f"{subject}, 숫자가 움직인 진짜 배경", f"{subject}, 수치보다 먼저 봐야 할 한 가지", *candidates]
-    if re.search(r"확정|발표|공개|출시|시행", source_text):
-        candidates.insert(0, f"{subject}, 공식 발표에서 놓치면 안 될 핵심")
-
-    category_candidates = {
-        "연예": [f"{subject}, 반응이 커진 진짜 이유", f"{subject}, 모두가 궁금해한 핵심만 정리"],
-        "국내 이슈": [f"{subject}, 지금 반드시 알아야 할 핵심", f"{subject} 이슈, 핵심은 따로 있었습니다"],
-        "해외 이슈": [f"{subject}, 해외 보도에서 놓치면 안 될 부분", f"{subject}, 국내 보도만 보면 놓치는 핵심"],
-        "경제·주식": [f"{subject}, 숫자보다 먼저 봐야 할 한 가지", f"{subject}, 투자자가 놓치기 쉬운 핵심"],
-        "생활정보": [f"{subject}, 나에게 해당되는지 30초 확인", f"{subject}, 모르고 지나치면 놓치는 조건"],
-        "제품·리뷰": [f"{subject}, 사기 전에 반드시 볼 포인트", f"{subject}, 광고보다 먼저 확인할 한 가지"],
-    }
-    candidates.extend(category_candidates.get(category, []))
+        candidates = [f"{subject}, 숫자 움직이자 모두가 다시 본 한 가지", f"{subject}, 급변 뒤에 숨은 진짜 배경", *candidates]
 
     cleaned: list[str] = []
     for candidate in candidates:
         candidate = re.sub(r"\s+", " ", candidate).strip(" -|｜")
         if not candidate or any(word in candidate for word in TITLE_BANNED_WORDS):
             continue
-        if len(candidate) > 44:
-            candidate = _short_caption(candidate, 42)
+        candidate = re.sub(r"([가-힣]{2,4})(?:은|는)\s+배우,", r"\1,", candidate)
+        if len(candidate) > 46:
+            candidate = _short_caption(candidate, 44)
         if candidate not in cleaned:
             cleaned.append(candidate)
 
     cleaned.sort(key=lambda item: _title_score(item, subject, title_numbers, style), reverse=True)
     return cleaned[:8] or [_short_caption(clean_title, 42)]
 
-
-def generate_zero_key_plan(article: ArticleData, duration: int, category: str, title_style: str = "강한 후킹형 · 클릭 유도 추천") -> dict[str, Any]:
+def generate_zero_key_plan(article: ArticleData, duration: int, category: str, title_style: str = "초강력 후킹형 · 사실 기반 자극형") -> dict[str, Any]:
     """외부 생성형 AI 없이 제목·핵심어·수치만 구조화해 새 대본을 만든다."""
     title = _clean_article_title(article.title)
     body = re.sub(r"\s+", " ", article.text or "").strip()
@@ -867,7 +947,7 @@ def normalize_plan(plan: dict[str, Any], article: ArticleData, duration: int) ->
     return {
         "video_title": selected_title,
         "title_candidates": title_candidates[:8] or [selected_title],
-        "title_style": str(plan.get("title_style") or "강한 후킹형 · 클릭 유도 추천"),
+        "title_style": str(plan.get("title_style") or "초강력 후킹형 · 사실 기반 자극형"),
         "hook": str(plan.get("hook") or scenes[0]["narration"]).strip(),
         "narration": narration,
         "description": str(plan.get("description") or f"원문 출처: {article.url}").strip(),
@@ -1554,6 +1634,54 @@ def process_user_voice(input_path: Path, preset: str, output_path: Path) -> None
     )
 
 
+
+SIGNATURE_VOICE_PROFILE = {
+    "label": "윤영 시그니처 · 내 목소리 톤 기반 AI",
+    "voice": "ko-KR-HyunsuNeural",
+    "rate": "+13%",
+    "profile": "yoonyoung_signature",
+    # 업로드된 음성에서 추출한 비식별 스타일 값만 반영: 낮고 안정적인 중심음, 약 123 BPM의 말하기 리듬,
+    # 중저역은 정리하고 3~7kHz 명료도를 높이는 방향. 원본 음성 파일은 앱/저장소에 포함하지 않는다.
+}
+
+
+def _signature_voice_filter(profile: str, use_rubberband: bool = True) -> str:
+    common = (
+        "highpass=f=85,lowpass=f=14000,afftdn=nf=-28,"
+        "deesser=i=0.18:m=0.45:f=0.5,"
+        "equalizer=f=180:t=q:w=1:g=-1.8,"
+        "equalizer=f=950:t=q:w=1:g=1.2,"
+        "equalizer=f=3300:t=q:w=1:g=3.2,"
+        "equalizer=f=6800:t=q:w=1:g=1.3,"
+    )
+    pitch = "rubberband=pitch=0.975:tempo=1.0," if use_rubberband else "asetrate=48000*0.975,aresample=48000,atempo=1.02564,"
+    finish = (
+        "acompressor=threshold=-20dB:ratio=2.8:attack=8:release=145:makeup=2.4,"
+        "alimiter=limit=0.94:attack=5:release=60,"
+        "loudnorm=I=-15:TP=-1:LRA=6"
+    )
+    return common + pitch + finish
+
+
+def process_ai_signature_voice(input_path: Path, profile: str, output_path: Path) -> None:
+    if not input_path.exists() or input_path.stat().st_size < 1000:
+        raise ShortsMakerError("AI 성우 원본 음성이 비어 있습니다.")
+    primary = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-af", _signature_voice_filter(profile, use_rubberband=True),
+        "-c:a", "libmp3lame", "-b:a", "192k", str(output_path),
+    ]
+    result = subprocess.run(primary, capture_output=True, text=True, check=False)
+    if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
+        return
+    fallback = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-af", _signature_voice_filter(profile, use_rubberband=False),
+        "-c:a", "libmp3lame", "-b:a", "192k", str(output_path),
+    ]
+    _run(fallback, "내 목소리 톤 기반 AI 보정")
+
+
 def _music_asset_path(track_label: str) -> Path | None:
     filename = MUSIC_TRACK_OPTIONS.get(track_label)
     if not filename:
@@ -1601,6 +1729,7 @@ def render_video(
     music_track: str = "자동 추천",
     music_volume: float = 0.11,
     custom_music: Path | None = None,
+    ai_voice_profile: str = "",
 ) -> dict[str, Path]:
     progress = progress or (lambda _: None)
     temp_root = Path(workdir or tempfile.mkdtemp(prefix="shortsmaker_"))
@@ -1612,12 +1741,20 @@ def render_video(
     if narration_audio is not None:
         progress("업로드한 내 목소리를 깨끗하고 듣기 좋게 보정하고 있습니다.")
         process_user_voice(narration_audio, voice_preset, audio_path)
-        actual_voice = f"내 목소리 보정 · {voice_preset}"
-        voice_mode = "내 목소리"
+        actual_voice = f"내 목소리 직접 녹음 보정 · {voice_preset}"
+        voice_mode = "내 목소리 직접 녹음"
     else:
         progress("AI 성우 나레이션을 생성하고 있습니다.")
-        actual_voice = synthesize_edge_tts(narration, voice, rate, audio_path)
-        voice_mode = "AI 성우"
+        raw_tts_path = temp_root / "narration_raw.mp3"
+        actual_voice = synthesize_edge_tts(narration, voice, rate, raw_tts_path)
+        if ai_voice_profile:
+            progress("등록된 내 목소리 톤을 반영해 더 또렷하고 듣기 좋은 음색으로 변조하고 있습니다.")
+            process_ai_signature_voice(raw_tts_path, ai_voice_profile, audio_path)
+            actual_voice = f"윤영 시그니처 AI · {actual_voice}"
+            voice_mode = "내 목소리 톤 기반 AI"
+        else:
+            shutil.move(str(raw_tts_path), str(audio_path))
+            voice_mode = "AI 성우"
 
     audio_duration = ffprobe_duration(audio_path)
     durations = allocate_durations(scenes, max(audio_duration + 0.35, 3.0 * len(scenes)))
@@ -1753,7 +1890,7 @@ def render_video(
     )
     report_path = temp_root / "copyright_check_report.txt"
     report_path.write_text(
-        "쇼츠메이커 CLOUD V3.2 저작권 안전 점검\n\n"
+        "쇼츠메이커 CLOUD V3.3 저작권 안전 점검\n\n"
         "[대본]\n기사 원문 직접 낭독: 사용 안 함\n사실 기반 재작성: 적용\n"
         f"원문과 최장 연속 유사 어절: {int(plan.get('originality_overlap_words') or 0)}어절\n"
         "[영상]\n기사 대표 사진: 사용 안 함\n방송 캡처/타 유튜브 영상: 사용 안 함\n"
@@ -1795,7 +1932,7 @@ def render_video(
         "zip": zip_path,
     }
 
-# 쇼츠메이커 CLOUD V3.2
+# 쇼츠메이커 CLOUD V3.3
 # 제목 자동 적용 + 나레이션 선택 복원 버전
 # 기사 링크를 붙여넣고 Enter를 누르면 제목/대본을 자동 생성합니다.
 
@@ -1808,15 +1945,15 @@ from pathlib import Path
 import streamlit as st
 
 
-VERSION = "3.2"
-STATE_PLAN = "v32_plan"
-STATE_RESULT = "v32_result"
-STATE_AUTO_REQUEST = "v32_auto_request"
+VERSION = "3.3"
+STATE_PLAN = "v33_plan"
+STATE_RESULT = "v33_result"
+STATE_AUTO_REQUEST = "v33_auto_request"
 
 
 def _request_article_analysis() -> None:
     """기사 링크 입력을 마치면 분석 예약 플래그만 설정한다."""
-    if str(st.session_state.get("v32-url", "")).strip():
+    if str(st.session_state.get("v33-url", "")).strip():
         st.session_state[STATE_AUTO_REQUEST] = True
 
 
@@ -1828,7 +1965,7 @@ def _safe_download_name(title: str, suffix: str) -> str:
 
 
 st.set_page_config(
-    page_title="쇼츠메이커 CLOUD V3.2",
+    page_title="쇼츠메이커 CLOUD V3.3",
     page_icon="🎬",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -1856,17 +1993,18 @@ st.markdown(
 @media (max-width:700px) {.hero{padding:21px 19px}.hero h1{font-size:1.62rem}.block-container{padding-left:.8rem;padding-right:.8rem}.title-card .title{font-size:1.18rem}}
 </style>
 <div class="hero">
-  <h1>🎬 쇼츠메이커 CLOUD V3.2</h1>
-  <p>기사 링크만 넣으면 주목형 제목을 자동 적용하고, AI 성우 또는 내 목소리를 직접 선택해 제작합니다.</p>
+  <h1>🎬 쇼츠메이커 CLOUD V3.3</h1>
+  <p>기사 링크만 넣으면 사실 기반 초강력 후킹 제목을 자동 적용하고, 내 목소리 톤 기반 AI 또는 원하는 성우로 제작합니다.</p>
   <div class="pills">
     <span class="pill">링크 입력 후 제목 자동 생성</span>
+    <span class="pill">내 목소리 톤 기반 AI</span>
     <span class="pill">AI 성우 10종 선택</span>
     <span class="pill">내 목소리 보정 선택</span>
     <span class="pill">자동 BGM</span>
     <span class="pill">기사 사진 미사용</span>
   </div>
 </div>
-<div class="info-box"><b>이번 수정 핵심</b><br>나레이션 선택을 첫 화면에 다시 배치했습니다. 기사 링크를 붙여넣고 Enter를 누르거나 분석 버튼을 누르면, 가장 주목도 높은 제목이 즉시 영상 제목으로 자동 적용됩니다.</div>
+<div class="info-box"><b>V3.3 핵심</b><br>“이탁수는 배우” 같은 설명형 제목을 제거하고, 인물·사건·반전 요소를 조합한 초강력 후킹 제목을 1순위로 적용합니다. 업로드해주신 음성은 원본을 저장하지 않고 톤·속도·명료도 스타일만 추출해 ‘윤영 시그니처 AI’에 반영했습니다.</div>
 <div class="safe-box"><b>과장 방지</b><br>클릭을 유도하되 기사에 없는 사실을 만들거나 ‘충격·무조건·100%’ 같은 허위·과장 표현은 사용하지 않습니다.</div>
 """,
     unsafe_allow_html=True,
@@ -1884,8 +2022,8 @@ with st.expander("📱 휴대폰·PC에 바로가기 설치", expanded=False):
     )
 
 with st.expander("다른 기기에서 이어서 수정할 프로젝트 불러오기", expanded=False):
-    project_upload = st.file_uploader("프로젝트 JSON", type=["json"], key="v32-project-import")
-    if project_upload is not None and st.button("프로젝트 불러오기", use_container_width=True, key="v32-project-load"):
+    project_upload = st.file_uploader("프로젝트 JSON", type=["json"], key="v33-project-import")
+    if project_upload is not None and st.button("프로젝트 불러오기", use_container_width=True, key="v33-project-load"):
         try:
             payload = json.loads(project_upload.getvalue().decode("utf-8"))
             article = ArticleData(**payload["article"])
@@ -1898,7 +2036,7 @@ with st.expander("다른 기기에서 이어서 수정할 프로젝트 불러오
                 "title_style": payload.get("title_style", TITLE_STYLE_OPTIONS[0]),
                 "engine": "무키 자체 해설 엔진",
             }
-            for key in ("v32-title-choice", "v32-custom-title", "v32-script"):
+            for key in ("v33-title-choice", "v33-custom-title", "v33-script"):
                 st.session_state.pop(key, None)
             st.session_state.pop(STATE_RESULT, None)
             st.success("프로젝트를 불러왔습니다.")
@@ -1911,61 +2049,70 @@ st.markdown('<div class="step">1. 기사 링크와 제작 조건</div>', unsafe_
 url = st.text_input(
     "대표 기사 링크 · 붙여넣고 Enter를 누르면 자동 분석",
     placeholder="https://m.entertain.naver.com/article/...",
-    key="v32-url",
+    key="v33-url",
     on_change=_request_article_analysis,
 )
 with st.expander("링크 분석이 막힐 때만 기사 제목·본문 직접 입력", expanded=False):
-    manual_title = st.text_input("기사 제목", placeholder="기사 제목", key="v32-manual-title")
+    manual_title = st.text_input("기사 제목", placeholder="기사 제목", key="v33-manual-title")
     manual_text = st.text_area(
         "기사 본문",
         placeholder="본문 추출이 막힌 경우에만 붙여넣으세요. 기사 사진은 사용하지 않습니다.",
         height=135,
-        key="v32-manual-text",
+        key="v33-manual-text",
     )
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    category = st.selectbox("콘텐츠 유형", ["연예", "국내 이슈", "해외 이슈", "경제·주식", "생활정보", "제품·리뷰"], key="v32-category")
+    category = st.selectbox("콘텐츠 유형", ["연예", "국내 이슈", "해외 이슈", "경제·주식", "생활정보", "제품·리뷰"], key="v33-category")
 with c2:
-    target_duration = st.selectbox("목표 길이", [30, 45, 60], index=1, format_func=lambda x: f"{x}초", key="v32-duration")
+    target_duration = st.selectbox("목표 길이", [30, 45, 60], index=1, format_func=lambda x: f"{x}초", key="v33-duration")
 with c3:
     title_style = st.selectbox(
         "자동 제목 스타일",
         TITLE_STYLE_OPTIONS,
         index=0,
         help="가장 높은 점수의 제목이 영상에 자동 적용됩니다.",
-        key="v32-title-style",
+        key="v33-title-style",
     )
 
 # 2. 나레이션 선택 - 계획 생성 전부터 항상 표시
 st.markdown('<div class="step">2. 나레이션 선택</div>', unsafe_allow_html=True)
 narration_mode = st.radio(
     "사용할 목소리",
-    ["AI 성우 중 선택", "내 목소리 녹음·업로드 후 보정"],
+    ["내 목소리 톤 기반 AI", "AI 성우 중 선택", "내 목소리 직접 녹음·보정"],
     horizontal=True,
-    key="v32-narration-mode",
+    key="v33-narration-mode",
 )
 voice_label = list(VOICE_OPTIONS)[0]
 rate_label = "쇼츠 추천"
 voice_preset_label = "밝고 듣기 좋게"
 uploaded_voice = None
 recorded_audio = None
-if narration_mode == "AI 성우 중 선택":
+ai_voice_profile = ""
+if narration_mode == "내 목소리 톤 기반 AI":
+    ai_voice_profile = SIGNATURE_VOICE_PROFILE["profile"]
+    voice_label = next((label for label, info in VOICE_OPTIONS.items() if info["voice"] == SIGNATURE_VOICE_PROFILE["voice"]), list(VOICE_OPTIONS)[0])
+    st.markdown(
+        '<div class="note"><b>🎙️ 윤영 시그니처 AI</b><br>업로드해주신 음성에서 추출한 낮고 안정적인 중심 톤, 말하기 리듬, 명료도 성향을 AI 성우에 적용합니다. 원본 음성은 GitHub나 앱에 저장하지 않으며, 완전한 음성 복제가 아니라 개인정보를 덜 노출하는 ‘목소리 스타일 반영’ 방식입니다.</div>',
+        unsafe_allow_html=True,
+    )
+    rate_label = "조금 빠르게"
+elif narration_mode == "AI 성우 중 선택":
     v1, v2 = st.columns(2)
     with v1:
-        voice_label = st.selectbox("AI 성우", list(VOICE_OPTIONS), index=0, key="v32-ai-voice")
+        voice_label = st.selectbox("AI 성우", list(VOICE_OPTIONS), index=0, key="v33-ai-voice")
     with v2:
-        rate_label = st.selectbox("말하기 속도", list(RATE_OPTIONS), index=2, key="v32-ai-rate")
-    st.caption("AI 성우 10종 중 선택할 수 있으며, 별도 API 키 입력은 없습니다.")
+        rate_label = st.selectbox("말하기 속도", list(RATE_OPTIONS), index=2, key="v33-ai-rate")
+    st.caption("AI 성우 10종 중 영상마다 원하는 목소리를 선택할 수 있습니다.")
 else:
     v1, v2 = st.columns(2)
     with v1:
-        voice_preset_label = st.selectbox("내 목소리 보정 스타일", list(VOICE_PRESET_OPTIONS), index=1, key="v32-my-preset")
+        voice_preset_label = st.selectbox("내 목소리 보정 스타일", list(VOICE_PRESET_OPTIONS), index=1, key="v33-my-preset")
     with v2:
-        uploaded_voice = st.file_uploader("대본 전체를 읽은 음성 파일", type=["wav", "mp3", "m4a", "aac", "ogg"], key="v32-my-upload")
+        uploaded_voice = st.file_uploader("대본 전체를 읽은 음성 파일", type=["wav", "mp3", "m4a", "aac", "ogg"], key="v33-my-upload")
     if hasattr(st, "audio_input"):
-        recorded_audio = st.audio_input("또는 브라우저에서 직접 녹음", key="v32-my-record")
-    st.caption("짧은 샘플로 목소리를 복제하는 방식이 아니라, 대본 전체 녹음을 선택한 분위기로 보정합니다.")
+        recorded_audio = st.audio_input("또는 브라우저에서 직접 녹음", key="v33-my-record")
+    st.caption("직접 읽은 음성을 노이즈 제거·EQ·압축·명료도 보정·톤 변조해 영상에 넣습니다.")
 
 # 3. 음악
 st.markdown('<div class="step">3. 배경음악</div>', unsafe_allow_html=True)
@@ -1974,38 +2121,38 @@ with m1:
     music_ui = st.selectbox(
         "음악 방식",
         ["콘텐츠에 맞춰 자동 추천", "내장 오리지널 중 직접 선택", "YouTube 오디오 라이브러리 음원 업로드", "음악 사용 안 함"],
-        key="v32-music-mode",
+        key="v33-music-mode",
     )
 with m2:
-    selected_music = st.selectbox("내장 음악", list(MUSIC_TRACK_OPTIONS), disabled=music_ui != "내장 오리지널 중 직접 선택", key="v32-music-track")
+    selected_music = st.selectbox("내장 음악", list(MUSIC_TRACK_OPTIONS), disabled=music_ui != "내장 오리지널 중 직접 선택", key="v33-music-track")
 with m3:
-    music_volume_pct = st.slider("배경음악 크기", 3, 25, 10, 1, format="%d%%", disabled=music_ui == "음악 사용 안 함", key="v32-music-volume")
+    music_volume_pct = st.slider("배경음악 크기", 3, 25, 10, 1, format="%d%%", disabled=music_ui == "음악 사용 안 함", key="v33-music-volume")
 custom_music_upload = None
 attribution_text = ""
 if music_ui == "YouTube 오디오 라이브러리 음원 업로드":
     c1, c2 = st.columns(2)
     with c1:
-        custom_music_upload = st.file_uploader("다운로드한 음원", type=["mp3", "wav", "m4a", "aac", "ogg"], key="v32-music-upload")
+        custom_music_upload = st.file_uploader("다운로드한 음원", type=["mp3", "wav", "m4a", "aac", "ogg"], key="v33-music-upload")
     with c2:
-        attribution_text = st.text_input("저작자 표시 문구 (필요한 곡만)", placeholder="Music: 곡명 - 아티스트", key="v32-attribution")
+        attribution_text = st.text_input("저작자 표시 문구 (필요한 곡만)", placeholder="Music: 곡명 - 아티스트", key="v33-attribution")
 
 # 4. 디자인
 st.markdown('<div class="step">4. 영상 디자인</div>', unsafe_allow_html=True)
 d1, d2, d3 = st.columns(3)
 with d1:
-    template_label = st.selectbox("영상 템플릿", list(TEMPLATE_OPTIONS), index=0, key="v32-template")
+    template_label = st.selectbox("영상 템플릿", list(TEMPLATE_OPTIONS), index=0, key="v33-template")
 with d2:
-    subtitle_label = st.selectbox("자막 스타일", list(SUBTITLE_STYLE_OPTIONS), index=0, key="v32-subtitle")
+    subtitle_label = st.selectbox("자막 스타일", list(SUBTITLE_STYLE_OPTIONS), index=0, key="v33-subtitle")
 with d3:
-    accent_label = st.selectbox("강조 색상", list(ACCENT_COLOR_OPTIONS), index=0, key="v32-accent")
+    accent_label = st.selectbox("강조 색상", list(ACCENT_COLOR_OPTIONS), index=0, key="v33-accent")
 d4, d5 = st.columns(2)
 with d4:
-    resolution_label = st.selectbox("출력 해상도", list(RESOLUTION_OPTIONS), index=0, key="v32-resolution")
+    resolution_label = st.selectbox("출력 해상도", list(RESOLUTION_OPTIONS), index=0, key="v33-resolution")
 with d5:
-    show_hook = st.toggle("자동 생성 제목을 영상 상단에 표시", value=True, key="v32-show-title")
+    show_hook = st.toggle("자동 생성 제목을 영상 상단에 표시", value=True, key="v33-show-title")
 st.caption("노란색 ‘연예’ 배지는 표시하지 않습니다. 기사 사진 대신 프로그램 자체 에디토리얼 그래픽을 사용합니다.")
 
-make_plan = st.button("🔥 기사 분석 + 주목형 제목·대본 자동 생성", type="primary", use_container_width=True, key="v32-make-plan")
+make_plan = st.button("🔥 기사 분석 + 초강력 후킹 제목·대본 자동 생성", type="primary", use_container_width=True, key="v33-make-plan")
 auto_requested = bool(st.session_state.pop(STATE_AUTO_REQUEST, False))
 should_make_plan = make_plan or (auto_requested and url.strip())
 
@@ -2044,7 +2191,7 @@ if should_make_plan:
         if manual_title.strip():
             article.title = manual_title.strip()
 
-        progress.progress(45, text="주목도가 높은 제목 후보를 평가하고 있습니다.")
+        progress.progress(45, text="사실관계를 유지하면서 가장 강한 후킹 제목을 평가하고 있습니다.")
         raw = generate_zero_key_plan(article, target_duration, category, title_style)
         plan = normalize_plan(raw, article, target_duration)
         # 1위 제목을 즉시 영상 제목으로 자동 확정한다.
@@ -2061,7 +2208,7 @@ if should_make_plan:
             "engine": "무키 자체 해설 엔진",
         }
         st.session_state.pop(STATE_RESULT, None)
-        for key in ("v32-title-choice", "v32-custom-title", "v32-script"):
+        for key in ("v33-title-choice", "v33-custom-title", "v33-script"):
             st.session_state.pop(key, None)
     except ShortsMakerError as exc:
         progress.empty(); status.empty(); st.error(str(exc))
@@ -2084,13 +2231,13 @@ if plan_state:
         "제목 후보를 바꾸면 영상 제목도 즉시 변경됩니다",
         candidates,
         index=candidates.index(plan["video_title"]) if plan.get("video_title") in candidates else 0,
-        key="v32-title-choice",
+        key="v33-title-choice",
     )
     custom_title = st.text_input(
         "직접 수정할 제목 (비워두면 위에서 선택한 제목 사용)",
         value="",
         placeholder="직접 바꾸고 싶은 경우에만 입력",
-        key="v32-custom-title",
+        key="v33-custom-title",
     )
     applied_title = custom_title.strip() or selected_candidate
     plan["video_title"] = applied_title
@@ -2102,7 +2249,7 @@ if plan_state:
 
     t1, t2 = st.columns([1, 1])
     with t1:
-        if st.button("🔄 다른 분위기의 제목 후보 만들기", use_container_width=True, key="v32-new-title-style"):
+        if st.button("🔄 다른 분위기의 제목 후보 만들기", use_container_width=True, key="v33-new-title-style"):
             style_index = TITLE_STYLE_OPTIONS.index(active_title_style) if active_title_style in TITLE_STYLE_OPTIONS else 0
             next_style = TITLE_STYLE_OPTIONS[(style_index + 1) % len(TITLE_STYLE_OPTIONS)]
             refreshed = generate_attention_titles(article, category, style=next_style)
@@ -2111,7 +2258,7 @@ if plan_state:
             plan["title_style"] = next_style
             st.session_state[STATE_PLAN]["title_style"] = next_style
             st.session_state[STATE_PLAN]["plan"] = plan
-            for key in ("v32-title-choice", "v32-custom-title"):
+            for key in ("v33-title-choice", "v33-custom-title"):
                 st.session_state.pop(key, None)
             st.rerun()
     with t2:
@@ -2121,7 +2268,7 @@ if plan_state:
         "읽을 전체 대본 · 직접 수정 가능",
         value=plan["narration"],
         height=270,
-        key="v32-script",
+        key="v33-script",
     )
 
     col_info, col_save = st.columns([1.2, 1])
@@ -2146,21 +2293,21 @@ if plan_state:
         st.download_button(
             "💾 다른 기기용 프로젝트 저장",
             json.dumps(project_payload, ensure_ascii=False, indent=2).encode("utf-8"),
-            file_name="shorts_project_v32.json",
+            file_name="shorts_project_v33.json",
             mime="application/json",
             use_container_width=True,
         )
-        selected_voice_summary = voice_label if narration_mode == "AI 성우 중 선택" else f"내 목소리 · {voice_preset_label}"
+        selected_voice_summary = ("윤영 시그니처 · 내 목소리 톤 기반 AI" if narration_mode == "내 목소리 톤 기반 AI" else voice_label if narration_mode == "AI 성우 중 선택" else f"내 목소리 직접 녹음 · {voice_preset_label}")
         st.markdown(
             f'<div class="note"><b>현재 제작 설정</b><br>제목: {html_lib.escape(applied_title)}<br>목소리: {html_lib.escape(selected_voice_summary)}<br>음악: {html_lib.escape(music_ui)}</div>',
             unsafe_allow_html=True,
         )
 
-    render = st.button("🎬 이 제목·목소리로 쇼츠 완성하기", type="primary", use_container_width=True, key="v32-render")
+    render = st.button("🎬 이 제목·목소리로 쇼츠 완성하기", type="primary", use_container_width=True, key="v33-render")
     if render:
         source_audio = uploaded_voice or recorded_audio
-        if narration_mode != "AI 성우 중 선택" and source_audio is None:
-            st.error("내 목소리 방식을 선택하셨습니다. 대본 전체를 읽은 음성 파일을 올리거나 직접 녹음해주세요.")
+        if narration_mode == "내 목소리 직접 녹음·보정" and source_audio is None:
+            st.error("내 목소리 직접 녹음 방식을 선택하셨습니다. 대본 전체를 읽은 음성 파일을 올리거나 직접 녹음해주세요.")
             st.stop()
         if music_ui == "YouTube 오디오 라이브러리 음원 업로드" and custom_music_upload is None:
             st.error("사용할 YouTube 오디오 라이브러리 음원을 업로드해주세요.")
@@ -2173,7 +2320,7 @@ if plan_state:
             plan.setdefault("title_candidates", []).insert(0, applied_title)
         st.session_state[STATE_PLAN]["plan"] = plan
 
-        workdir = Path(tempfile.mkdtemp(prefix="shortsmaker_cloud_v32_"))
+        workdir = Path(tempfile.mkdtemp(prefix="shortsmaker_cloud_v33_"))
         narration_path = None
         if source_audio is not None:
             suffix = Path(getattr(source_audio, "name", "voice.wav")).suffix or ".wav"
@@ -2184,6 +2331,10 @@ if plan_state:
             suffix = Path(custom_music_upload.name).suffix or ".mp3"
             custom_music_path = workdir / f"custom_music{suffix}"
             custom_music_path.write_bytes(custom_music_upload.getvalue())
+
+        if narration_mode == "내 목소리 톤 기반 AI":
+            voice_label = next((label for label, info in VOICE_OPTIONS.items() if info["voice"] == SIGNATURE_VOICE_PROFILE["voice"]), voice_label)
+            rate_label = next((label for label, value in RATE_OPTIONS.items() if value == SIGNATURE_VOICE_PROFILE["rate"]), "시그니처 추천")
 
         music_mode_map = {
             "콘텐츠에 맞춰 자동 추천": "auto",
@@ -2216,6 +2367,7 @@ if plan_state:
                 music_track=selected_music if music_ui == "내장 오리지널 중 직접 선택" else "자동 추천",
                 music_volume=music_volume_pct / 100.0,
                 custom_music=custom_music_path,
+                ai_voice_profile=ai_voice_profile,
             )
             if attribution_text.strip():
                 with files["music_license"].open("a", encoding="utf-8") as fh:
@@ -2253,7 +2405,7 @@ if result:
             "video/mp4",
             type="primary",
             use_container_width=True,
-            key=f"v32-video-{result['key']}",
+            key=f"v33-video-{result['key']}",
         )
         st.download_button(
             "⬇️ 결과 전체 ZIP",
@@ -2261,11 +2413,11 @@ if result:
             _safe_download_name(result.get("title") or "쇼츠영상", "_전체파일.zip"),
             "application/zip",
             use_container_width=True,
-            key=f"v32-zip-{result['key']}",
+            key=f"v33-zip-{result['key']}",
         )
     with right:
-        st.download_button("대본 TXT", result["script"], "script.txt", "text/plain", use_container_width=True, key=f"v32-script-dl-{result['key']}")
-        st.download_button("자막 SRT", result["srt"], "subtitles.srt", "text/plain", use_container_width=True, key=f"v32-srt-{result['key']}")
-        st.download_button("YouTube 제목·설명", result["metadata"], "youtube_metadata.txt", "text/plain", use_container_width=True, key=f"v32-meta-{result['key']}")
-        st.download_button("저작권 점검 보고서", result["copyright_report"], "copyright_check_report.txt", "text/plain", use_container_width=True, key=f"v32-copy-{result['key']}")
+        st.download_button("대본 TXT", result["script"], "script.txt", "text/plain", use_container_width=True, key=f"v33-script-dl-{result['key']}")
+        st.download_button("자막 SRT", result["srt"], "subtitles.srt", "text/plain", use_container_width=True, key=f"v33-srt-{result['key']}")
+        st.download_button("YouTube 제목·설명", result["metadata"], "youtube_metadata.txt", "text/plain", use_container_width=True, key=f"v33-meta-{result['key']}")
+        st.download_button("저작권 점검 보고서", result["copyright_report"], "copyright_check_report.txt", "text/plain", use_container_width=True, key=f"v33-copy-{result['key']}")
         st.markdown('<div class="note"><b>업로드 순서</b><br>MP4를 YouTube Shorts에 올리고, `youtube_metadata.txt`의 제목·설명·해시태그를 복사하세요.</div>', unsafe_allow_html=True)
