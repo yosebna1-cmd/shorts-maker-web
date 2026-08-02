@@ -58,6 +58,36 @@ RATE_OPTIONS = {
     "매우 빠르게": "+22%",
 }
 
+TEMPLATE_OPTIONS = {
+    "자막 강조형 · 요즘 쇼츠 추천": "highlight",
+    "뉴스형 · 깔끔하고 신뢰감": "news",
+    "카드형 · 정보 정리형": "card",
+}
+
+SUBTITLE_STYLE_OPTIONS = {
+    "강조형 · 핵심 단어 컬러": "accent",
+    "깔끔형 · 흰색 볼드": "clean",
+    "반투명 박스형 · 가독성 우선": "box",
+}
+
+ACCENT_COLOR_OPTIONS = {
+    "노랑 · 시선 집중": (255, 216, 77),
+    "민트 · 산뜻한 느낌": (92, 225, 230),
+    "보라 · 세련된 느낌": (171, 126, 255),
+    "핑크 · 연예·화제형": (255, 112, 166),
+}
+
+BACKGROUND_MODE_OPTIONS = {
+    "자동 추천": "auto",
+    "화면 꽉 채우기": "cover",
+    "블러 배경 + 원본": "blur",
+}
+
+RESOLUTION_OPTIONS = {
+    "720×1280 · 빠른 제작": (720, 1280),
+    "1080×1920 · 고화질": (1080, 1920),
+}
+
 
 @dataclass
 class ArticleData:
@@ -317,6 +347,8 @@ def generate_plan_with_gemini(
 - 첫 장면은 2초 이내의 강한 궁금증형 후킹 문장입니다.
 - 전체 나레이션은 자연스러운 한국어 구어체이며 {duration}초 안에 읽을 수 있어야 합니다.
 - 장면은 6~9개, 장면별 화면 자막은 18자 안팎으로 짧게 씁니다.
+- caption은 최대 2줄로 자연스럽게 나눌 수 있는 문장으로 작성합니다.
+- emphasis는 화면에서 강조할 핵심 단어 1~2개를 배열로 작성합니다.
 - 마지막은 시청자 의견을 묻는 한 문장으로 끝냅니다.
 - stock_keywords는 이미지 검색에 쓸 영어 단어 2~4개로 작성합니다.
 
@@ -329,7 +361,7 @@ def generate_plan_with_gemini(
   "hashtags": ["#쇼츠"],
   "core_facts": ["", "", ""],
   "scenes": [
-    {{"caption": "", "narration": "", "stock_keywords": "", "visual_note": ""}}
+    {{"caption": "", "emphasis": [""], "narration": "", "stock_keywords": "", "visual_note": ""}}
   ]
 }}
 """.strip()
@@ -358,6 +390,23 @@ def _split_sentences(text: str) -> list[str]:
     return [part.strip(" -•\t") for part in parts if 25 <= len(part.strip()) <= 240]
 
 
+def _pick_emphasis(text: str, limit: int = 2) -> list[str]:
+    stopwords = {
+        "그리고", "하지만", "때문에", "관련", "대한", "이번", "사실", "정말", "바로",
+        "이유", "소식", "현재", "오늘", "여러분", "어떻게", "합니다", "했습니다",
+    }
+    tokens = [
+        re.sub(r"[^0-9A-Za-z가-힣·]", "", token)
+        for token in re.split(r"\s+", text)
+    ]
+    candidates = [
+        token for token in tokens
+        if 2 <= len(token) <= 12 and token not in stopwords and not token.endswith(("입니다", "했습니다"))
+    ]
+    candidates = sorted(_unique(candidates), key=lambda value: (-len(value), tokens.index(value)))
+    return candidates[:limit]
+
+
 def generate_local_plan(article: ArticleData, duration: int, category: str) -> dict[str, Any]:
     sentences = _split_sentences(article.text)
     filtered = [
@@ -381,7 +430,8 @@ def generate_local_plan(article: ArticleData, duration: int, category: str) -> d
     narration = " ".join(narration_parts)
     scenes = [
         {
-            "caption": _short_caption(part, 20),
+            "caption": _short_caption(part, 24),
+            "emphasis": _pick_emphasis(part),
             "narration": part,
             "stock_keywords": category,
             "visual_note": "기사 이미지 또는 정보형 그래픽",
@@ -425,9 +475,17 @@ def normalize_plan(plan: dict[str, Any], article: ArticleData, duration: int) ->
         if not caption and narration:
             caption = _short_caption(narration, 22)
         if narration:
+            emphasis_raw = scene.get("emphasis") or []
+            if isinstance(emphasis_raw, str):
+                emphasis = [part.strip() for part in re.split(r"[,/|]", emphasis_raw) if part.strip()]
+            else:
+                emphasis = [str(part).strip() for part in emphasis_raw if str(part).strip()]
+            if not emphasis:
+                emphasis = _pick_emphasis(caption or narration)
             scenes.append(
                 {
                     "caption": caption,
+                    "emphasis": emphasis[:2],
                     "narration": narration,
                     "stock_keywords": str(scene.get("stock_keywords") or "").strip(),
                     "visual_note": str(scene.get("visual_note") or "").strip(),
@@ -542,10 +600,12 @@ def search_pexels_image(query: str, api_key: str) -> str:
     return ""
 
 
+
 def find_font(bold: bool = True) -> str:
     candidates = [
-        "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf" if bold else "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/nanum/NanumSquareB.ttf" if bold else "/usr/share/fonts/truetype/nanum/NanumSquareR.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf" if bold else "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "C:/Windows/Fonts/malgunbd.ttf" if bold else "C:/Windows/Fonts/malgun.ttf",
     ]
@@ -555,16 +615,28 @@ def find_font(bold: bool = True) -> str:
     return candidates[-2]
 
 
-def _fit_cover(image: Image.Image, size: tuple[int, int]) -> Image.Image:
-    return ImageOps.fit(image.convert("RGB"), size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.42))
+def _fit_cover(image: Image.Image, size: tuple[int, int], center_y: float = 0.45) -> Image.Image:
+    return ImageOps.fit(
+        image.convert("RGB"),
+        size,
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, min(max(center_y, 0.0), 1.0)),
+    )
+
+
+def _fit_contain(image: Image.Image, size: tuple[int, int]) -> Image.Image:
+    result = image.convert("RGB").copy()
+    result.thumbnail(size, Image.Resampling.LANCZOS)
+    return result
 
 
 def _gradient_background(width: int, height: int, index: int) -> Image.Image:
     presets = [
-        ((21, 28, 55), (82, 67, 170)),
-        ((16, 54, 75), (29, 119, 105)),
-        ((62, 29, 68), (178, 66, 93)),
-        ((41, 45, 62), (111, 78, 55)),
+        ((22, 28, 52), (81, 54, 158)),
+        ((10, 50, 73), (22, 126, 116)),
+        ((66, 24, 65), (181, 53, 92)),
+        ((35, 39, 57), (128, 83, 47)),
+        ((19, 30, 49), (42, 98, 155)),
     ]
     start, end = presets[index % len(presets)]
     image = Image.new("RGB", (width, height))
@@ -576,80 +648,421 @@ def _gradient_background(width: int, height: int, index: int) -> Image.Image:
     return image
 
 
-def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
-    words = list(text) if " " not in text else text.split(" ")
+def _paste_rounded(base: Image.Image, foreground: Image.Image, xy: tuple[int, int], radius: int) -> None:
+    mask = Image.new("L", foreground.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, foreground.width, foreground.height), radius=radius, fill=255)
+    shadow = Image.new("RGBA", (foreground.width + radius * 2, foreground.height + radius * 2), (0, 0, 0, 0))
+    shadow_mask = Image.new("L", shadow.size, 0)
+    ImageDraw.Draw(shadow_mask).rounded_rectangle(
+        (radius, radius, radius + foreground.width, radius + foreground.height),
+        radius=radius,
+        fill=145,
+    )
+    shadow_mask = shadow_mask.filter(ImageFilter.GaussianBlur(max(8, radius // 2)))
+    shadow_layer = Image.new("RGBA", shadow.size, (0, 0, 0, 0))
+    shadow_layer.putalpha(shadow_mask)
+    base.alpha_composite(shadow_layer, (xy[0] - radius, xy[1] - radius))
+    base.paste(foreground.convert("RGBA"), xy, mask)
+
+
+def _prepare_background(
+    image_path: Path | None,
+    size: tuple[int, int],
+    index: int,
+    mode: str,
+    template: str,
+) -> Image.Image:
+    width, height = size
+    if not image_path or not image_path.exists():
+        return _gradient_background(width, height, index).convert("RGBA")
+
+    with Image.open(image_path) as opened:
+        original = opened.convert("RGB")
+
+    canvas_ratio = width / height
+    image_ratio = original.width / max(original.height, 1)
+    mismatch = max(image_ratio / canvas_ratio, canvas_ratio / max(image_ratio, 0.001))
+    selected_mode = mode
+    if mode == "auto":
+        selected_mode = "blur" if mismatch > 1.48 else "cover"
+
+    if selected_mode == "cover":
+        result = _fit_cover(original, size, 0.42).convert("RGBA")
+        result = ImageEnhance.Color(result.convert("RGB")).enhance(1.04).convert("RGBA")
+        return result
+
+    blurred = _fit_cover(original, size, 0.45).filter(ImageFilter.GaussianBlur(radius=max(18, width // 30)))
+    blurred = ImageEnhance.Brightness(blurred).enhance(0.56)
+    blurred = ImageEnhance.Color(blurred).enhance(0.84).convert("RGBA")
+
+    if template == "card":
+        max_w = int(width * 0.84)
+        max_h = int(height * 0.53)
+        top = int(height * 0.22)
+    else:
+        max_w = int(width * 0.91)
+        max_h = int(height * 0.62)
+        top = int(height * 0.20)
+    foreground = _fit_contain(original, (max_w, max_h))
+    x = (width - foreground.width) // 2
+    y = top + max(0, (max_h - foreground.height) // 2)
+    _paste_rounded(blurred, foreground, (x, y), radius=max(18, width // 28))
+    return blurred
+
+
+def _overlay_vertical_gradient(
+    base: Image.Image,
+    top_alpha: int = 135,
+    bottom_alpha: int = 210,
+    middle_alpha: int = 15,
+) -> Image.Image:
+    width, height = base.size
+    strip = Image.new("RGBA", (1, height), (0, 0, 0, 0))
+    strip_pixels = strip.load()
+    for y in range(height):
+        pos = y / max(height - 1, 1)
+        if pos < 0.34:
+            t = pos / 0.34
+            alpha = int(top_alpha * (1 - t) + middle_alpha * t)
+        elif pos > 0.53:
+            t = (pos - 0.53) / 0.47
+            alpha = int(middle_alpha * (1 - t) + bottom_alpha * t)
+        else:
+            alpha = middle_alpha
+        strip_pixels[0, y] = (0, 0, 0, alpha)
+    layer = strip.resize((width, height), Image.Resampling.NEAREST)
+    return Image.alpha_composite(base.convert("RGBA"), layer)
+
+
+def _measure(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, stroke: int = 0) -> tuple[int, int]:
+    box = draw.textbbox((0, 0), text or " ", font=font, stroke_width=stroke)
+    return box[2] - box[0], box[3] - box[1]
+
+
+def _wrap_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    max_width: int,
+    max_lines: int = 2,
+) -> list[str]:
+    clean = re.sub(r"\s+", " ", text).strip()
+    if not clean:
+        return [""]
+    words = clean.split(" ")
     lines: list[str] = []
     current = ""
-    separator = "" if " " not in text else " "
     for word in words:
-        candidate = current + (separator if current else "") + word
-        bbox = draw.textbbox((0, 0), candidate, font=font, stroke_width=2)
-        if bbox[2] - bbox[0] <= max_width:
+        candidate = f"{current} {word}".strip()
+        if _measure(draw, candidate, font, 2)[0] <= max_width:
             current = candidate
-        else:
-            if current:
-                lines.append(current)
+            continue
+        if current:
+            lines.append(current)
             current = word
-    if current:
+        else:
+            chunk = ""
+            for char in word:
+                test = chunk + char
+                if _measure(draw, test, font, 2)[0] <= max_width:
+                    chunk = test
+                else:
+                    if chunk:
+                        lines.append(chunk)
+                    chunk = char
+            current = chunk
+        if len(lines) >= max_lines:
+            break
+    if current and len(lines) < max_lines:
         lines.append(current)
-    return lines[:4]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+    joined = " ".join(lines)
+    if len(joined.replace(" ", "")) < len(clean.replace(" ", "")) and lines:
+        last = lines[-1]
+        while last and _measure(draw, last + "…", font, 2)[0] > max_width:
+            last = last[:-1]
+        lines[-1] = last.rstrip() + "…"
+    return lines
+
+
+def _fit_font_lines(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font_path: str,
+    start_size: int,
+    min_size: int,
+    max_width: int,
+    max_lines: int = 2,
+) -> tuple[ImageFont.FreeTypeFont, list[str]]:
+    size = start_size
+    while size >= min_size:
+        font = ImageFont.truetype(font_path, size)
+        lines = _wrap_text(draw, text, font, max_width, max_lines)
+        if len(lines) <= max_lines and all(_measure(draw, line, font, 3)[0] <= max_width for line in lines):
+            return font, lines
+        size -= 2
+    font = ImageFont.truetype(font_path, min_size)
+    return font, _wrap_text(draw, text, font, max_width, max_lines)
+
+
+def _matches_emphasis(token: str, emphasis: list[str]) -> bool:
+    clean = re.sub(r"[^0-9A-Za-z가-힣]", "", token)
+    return any(word and (word in clean or clean in word) for word in emphasis)
+
+
+def _draw_centered_line(
+    draw: ImageDraw.ImageDraw,
+    y: int,
+    line: str,
+    font: ImageFont.FreeTypeFont,
+    width: int,
+    fill: tuple[int, int, int],
+    accent: tuple[int, int, int],
+    emphasis: list[str],
+    stroke_width: int,
+    max_width: int,
+) -> int:
+    words = line.split(" ") if " " in line else [line]
+    space_w = _measure(draw, " ", font, stroke_width)[0]
+    widths = [_measure(draw, word, font, stroke_width)[0] for word in words]
+    total_w = sum(widths) + space_w * max(0, len(words) - 1)
+    x = max((width - total_w) // 2, (width - max_width) // 2)
+    for idx, word in enumerate(words):
+        color = accent if _matches_emphasis(word, emphasis) else fill
+        draw.text(
+            (x, y),
+            word,
+            font=font,
+            fill=color,
+            stroke_width=stroke_width,
+            stroke_fill=(5, 7, 12, 220),
+        )
+        x += widths[idx] + (space_w if idx < len(words) - 1 else 0)
+    return _measure(draw, line, font, stroke_width)[1]
+
+
+def _draw_badge(
+    canvas: Image.Image,
+    text: str,
+    x: int,
+    y: int,
+    accent: tuple[int, int, int],
+    scale: float,
+) -> tuple[int, int, int, int]:
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.truetype(find_font(True), max(18, int(21 * scale)))
+    text_w, text_h = _measure(draw, text, font)
+    pad_x, pad_y = int(18 * scale), int(9 * scale)
+    rect = (x, y, x + text_w + pad_x * 2, y + text_h + pad_y * 2)
+    draw.rounded_rectangle(rect, radius=int(18 * scale), fill=(*accent, 238))
+    draw.text((x + pad_x, y + pad_y - int(2 * scale)), text, font=font, fill=(18, 19, 24))
+    return rect
 
 
 def make_scene_card(
     image_path: Path | None,
     output_path: Path,
     caption: str,
+    emphasis: list[str],
     title: str,
+    hook: str,
+    category: str,
     source: str,
     index: int,
+    template: str = "highlight",
+    subtitle_style: str = "accent",
+    accent: tuple[int, int, int] = (255, 216, 77),
+    background_mode: str = "auto",
+    show_hook: bool = True,
+    show_badge: bool = True,
     size: tuple[int, int] = (720, 1280),
 ) -> None:
     width, height = size
-    if image_path and image_path.exists():
-        with Image.open(image_path) as original:
-            background = _fit_cover(original, size)
-        background = background.filter(ImageFilter.GaussianBlur(radius=0.5))
-        background = ImageEnhance.Contrast(background).enhance(0.94)
-    else:
-        background = _gradient_background(width, height, index)
+    scale = width / 720
+    margin = int(42 * scale)
+    canvas = _prepare_background(image_path, size, index, background_mode, template)
+    canvas = _overlay_vertical_gradient(
+        canvas,
+        top_alpha=170 if template != "card" else 190,
+        bottom_alpha=230 if template == "highlight" else 215,
+        middle_alpha=16,
+    )
+    draw = ImageDraw.Draw(canvas)
 
-    overlay = Image.new("RGBA", size, (0, 0, 0, 0))
-    overlay_draw = ImageDraw.Draw(overlay)
-    overlay_draw.rectangle((0, 0, width, height), fill=(0, 0, 0, 42))
-    overlay_draw.rectangle((0, int(height * 0.45), width, height), fill=(0, 0, 0, 150))
-    overlay_draw.rounded_rectangle((36, 42, 166, 94), radius=18, fill=(255, 255, 255, 225))
-    background = Image.alpha_composite(background.convert("RGBA"), overlay)
+    font_bold = find_font(True)
+    font_regular = find_font(False)
+    source_text = _short_caption(f"출처 · {source}" if source else "기사 기반 AI 요약", 54)
 
-    draw = ImageDraw.Draw(background)
-    font_badge = ImageFont.truetype(find_font(True), 24)
-    font_title = ImageFont.truetype(find_font(False), 23)
-    font_caption = ImageFont.truetype(find_font(True), 55)
-    font_source = ImageFont.truetype(find_font(False), 20)
-
-    draw.text((58, 58), "SHORTS", font=font_badge, fill=(20, 20, 24))
-    title_lines = _wrap_text(draw, _short_caption(title, 55), font_title, width - 90)
-    y = 120
-    for line in title_lines[:2]:
-        draw.text((45, y), line, font=font_title, fill=(245, 245, 245), stroke_width=1, stroke_fill=(0, 0, 0))
-        y += 34
-
-    lines = _wrap_text(draw, caption, font_caption, width - 88)
-    total_h = len(lines) * 74
-    y = max(int(height * 0.57), height - 230 - total_h)
-    for line in lines:
-        draw.text(
-            (44, y),
-            line,
-            font=font_caption,
-            fill=(255, 255, 255),
-            stroke_width=5,
-            stroke_fill=(0, 0, 0),
+    if template == "news":
+        if show_badge:
+            _draw_badge(canvas, category or "NEWS", margin, int(48 * scale), accent, scale)
+        title_y = int(118 * scale) if show_badge else int(62 * scale)
+        title_font, title_lines = _fit_font_lines(
+            draw,
+            _short_caption(title, 54),
+            font_bold,
+            int(38 * scale),
+            int(30 * scale),
+            width - margin * 2,
+            2,
         )
-        y += 74
+        for line in title_lines:
+            draw.text(
+                (margin, title_y),
+                line,
+                font=title_font,
+                fill=(255, 255, 255),
+                stroke_width=max(2, int(2 * scale)),
+                stroke_fill=(0, 0, 0, 185),
+            )
+            title_y += int(48 * scale)
+        box_top = int(height * 0.72)
+        box_bottom = height - int(72 * scale)
+        draw.rounded_rectangle(
+            (margin, box_top, width - margin, box_bottom),
+            radius=int(26 * scale),
+            fill=(9, 12, 20, 208),
+            outline=(*accent, 185),
+            width=max(2, int(3 * scale)),
+        )
+        caption_y = box_top + int(36 * scale)
+        caption_width = width - margin * 2 - int(54 * scale)
+    elif template == "card":
+        if show_badge:
+            _draw_badge(canvas, category or "INFO", margin, int(48 * scale), accent, scale)
+        hook_text = hook if show_hook else title
+        hook_font, hook_lines = _fit_font_lines(
+            draw,
+            _short_caption(hook_text, 52),
+            font_bold,
+            int(40 * scale),
+            int(30 * scale),
+            width - margin * 2,
+            2,
+        )
+        hook_y = int(116 * scale)
+        for line in hook_lines:
+            draw.text(
+                (margin, hook_y),
+                line,
+                font=hook_font,
+                fill=(255, 255, 255),
+                stroke_width=max(2, int(3 * scale)),
+                stroke_fill=(0, 0, 0, 195),
+            )
+            hook_y += int(50 * scale)
+        box_top = int(height * 0.73)
+        box_bottom = height - int(74 * scale)
+        draw.rounded_rectangle(
+            (margin, box_top, width - margin, box_bottom),
+            radius=int(28 * scale),
+            fill=(18, 20, 30, 222),
+        )
+        draw.rounded_rectangle(
+            (margin, box_top, margin + int(10 * scale), box_bottom),
+            radius=int(5 * scale),
+            fill=(*accent, 255),
+        )
+        caption_y = box_top + int(34 * scale)
+        caption_width = width - margin * 2 - int(66 * scale)
+    else:
+        if show_badge:
+            _draw_badge(canvas, category or "TREND", margin, int(48 * scale), accent, scale)
+        if show_hook:
+            hook_font, hook_lines = _fit_font_lines(
+                draw,
+                _short_caption(hook, 52),
+                font_bold,
+                int(41 * scale),
+                int(30 * scale),
+                width - margin * 2,
+                2,
+            )
+            hook_y = int(116 * scale)
+            for line in hook_lines:
+                draw.text(
+                    (margin, hook_y),
+                    line,
+                    font=hook_font,
+                    fill=(255, 255, 255),
+                    stroke_width=max(2, int(3 * scale)),
+                    stroke_fill=(0, 0, 0, 200),
+                )
+                hook_y += int(50 * scale)
+        caption_y = int(height * 0.72)
+        caption_width = width - margin * 2
 
-    footer = f"출처: {source}" if source else "기사 기반 AI 요약"
-    draw.text((44, height - 58), _short_caption(footer, 52), font=font_source, fill=(225, 225, 230))
-    background.convert("RGB").save(output_path, quality=95)
+    caption_font, caption_lines = _fit_font_lines(
+        draw,
+        caption,
+        font_bold,
+        int((58 if template == "highlight" else 52) * scale),
+        int(38 * scale),
+        caption_width,
+        2,
+    )
+    line_h = int(_measure(draw, "가나다", caption_font, 3)[1] * 1.28)
+    total_h = line_h * len(caption_lines)
+
+    if template == "highlight":
+        caption_y = min(caption_y, height - int(116 * scale) - total_h)
+        if subtitle_style == "box":
+            pad_y = int(24 * scale)
+            draw.rounded_rectangle(
+                (
+                    margin - int(12 * scale),
+                    caption_y - pad_y,
+                    width - margin + int(12 * scale),
+                    caption_y + total_h + pad_y,
+                ),
+                radius=int(26 * scale),
+                fill=(8, 10, 17, 196),
+            )
+    else:
+        caption_y = min(caption_y, height - int(118 * scale) - total_h)
+
+    if subtitle_style == "clean":
+        line_emphasis: list[str] = []
+    else:
+        line_emphasis = emphasis or _pick_emphasis(caption)
+
+    y = caption_y
+    for line in caption_lines:
+        _draw_centered_line(
+            draw,
+            y,
+            line,
+            caption_font,
+            width,
+            (255, 255, 255),
+            accent,
+            line_emphasis,
+            max(3, int(4 * scale)),
+            caption_width,
+        )
+        y += line_h
+
+    source_font = ImageFont.truetype(font_regular, max(16, int(18 * scale)))
+    source_y = height - int(49 * scale)
+    draw.text(
+        (margin, source_y),
+        source_text,
+        font=source_font,
+        fill=(224, 226, 234),
+        stroke_width=max(1, int(1 * scale)),
+        stroke_fill=(0, 0, 0, 145),
+    )
+    draw.text(
+        (width - margin, source_y),
+        f"{index + 1:02}",
+        anchor="ra",
+        font=source_font,
+        fill=accent,
+        stroke_width=max(1, int(1 * scale)),
+        stroke_fill=(0, 0, 0, 145),
+    )
+    canvas.convert("RGB").save(output_path, quality=96)
 
 
 def allocate_durations(scenes: list[dict[str, str]], total_duration: float) -> list[float]:
@@ -694,6 +1107,14 @@ def render_video(
     pexels_key: str = "",
     workdir: Path | None = None,
     progress: Callable[[str], None] | None = None,
+    template: str = "highlight",
+    subtitle_style: str = "accent",
+    accent: tuple[int, int, int] = (255, 216, 77),
+    background_mode: str = "auto",
+    show_hook: bool = True,
+    show_badge: bool = True,
+    category: str = "뉴스",
+    resolution: tuple[int, int] = (720, 1280),
 ) -> dict[str, Path]:
     progress = progress or (lambda _: None)
     temp_root = Path(workdir or tempfile.mkdtemp(prefix="shortsmaker_"))
@@ -730,9 +1151,19 @@ def render_video(
             image_path=image_path,
             output_path=card_path,
             caption=scene["caption"],
+            emphasis=scene.get("emphasis") or [],
             title=plan["video_title"],
+            hook=plan.get("hook") or plan["video_title"],
+            category=category,
             source=article.publisher or urllib.parse.urlparse(article.url).netloc,
             index=idx,
+            template=template,
+            subtitle_style=subtitle_style,
+            accent=accent,
+            background_mode=background_mode,
+            show_hook=show_hook,
+            show_badge=show_badge,
+            size=resolution,
         )
         clip_path = temp_root / f"clip_{idx:02}.mp4"
         _run(
@@ -746,7 +1177,12 @@ def render_video(
                 "-t",
                 f"{scene_duration:.3f}",
                 "-vf",
-                "scale=720:1280,format=yuv420p",
+                (
+                    f"scale={resolution[0]}:{resolution[1]},"
+                    f"zoompan=z='min(zoom+0.00035,1.045)':"
+                    f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+                    f"d=1:s={resolution[0]}x{resolution[1]}:fps=30,format=yuv420p"
+                ),
                 "-r",
                 "30",
                 "-c:v",
