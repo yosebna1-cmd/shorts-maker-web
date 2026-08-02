@@ -14,6 +14,7 @@ import textwrap
 import urllib.parse
 import wave
 import zipfile
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -494,46 +495,141 @@ def _pick_emphasis(text: str, limit: int = 2) -> list[str]:
     return candidates[:limit]
 
 
-def generate_local_plan(article: ArticleData, duration: int, category: str) -> dict[str, Any]:
-    sentences = _split_sentences(article.text)
-    filtered = [
-        sentence
-        for sentence in sentences
-        if not re.search(r"무단전재|재배포|기자|Copyright|구독|로그인|광고", sentence, re.I)
-    ]
-    selected: list[str] = []
-    for sentence in filtered:
-        if any(sentence[:25] in existing or existing[:25] in sentence for existing in selected):
-            continue
-        selected.append(sentence)
-        if len(selected) >= 6:
-            break
-    if not selected:
-        selected = [article.title]
+def _clean_article_title(title: str) -> str:
+    clean = re.sub(r"\s*[|｜·-]\s*(네이버|연합뉴스|뉴스|스포츠|엔터|신문|일보|방송|TV).*$", "", title or "", flags=re.I)
+    clean = re.sub(r"\[[^\]]{1,18}\]", "", clean)
+    clean = re.sub(r"\s+", " ", clean).strip(" -|｜·")
+    return clean or "오늘의 주요 소식"
 
-    hook = f"지금 화제가 된 건, 바로 {article.title[:35]}입니다."
-    closing = "여러분은 이 소식, 어떻게 보시나요?"
-    narration_parts = [hook, *selected[:5], closing]
-    narration = " ".join(narration_parts)
-    scenes = [
-        {
-            "caption": _short_caption(part, 24),
-            "emphasis": _pick_emphasis(part),
-            "narration": part,
-            "stock_keywords": category,
-            "visual_note": "실존 인물과 닮지 않은 정보형 에디토리얼 그래픽",
-        }
-        for part in narration_parts
+
+def _top_keywords(text: str, title: str, limit: int = 8) -> list[str]:
+    stopwords = {
+        "기자", "뉴스", "사진", "영상", "관련", "대한", "이번", "현재", "지난", "오늘", "당시",
+        "통해", "위해", "것으로", "것이다", "있다", "없다", "했다", "한다고", "하며", "에서", "으로",
+        "에게", "까지", "부터", "그리고", "하지만", "때문", "그는", "그녀는", "이날", "밝혔다", "전했다",
+        "공개", "소식", "내용", "사실", "경우", "여부", "대해", "따르면", "보도", "오전", "오후",
+    }
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9._-]{1,20}|[가-힣]{2,12}|\d+(?:[.,]\d+)?%?", f"{title} {text}")
+    score = Counter()
+    for token in tokens:
+        token = token.strip("._-")
+        if token in stopwords or token.lower() in stopwords or re.fullmatch(r"\d{1,2}", token):
+            continue
+        score[token] += 1
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9._-]{1,20}|[가-힣]{2,12}|\d+(?:[.,]\d+)?%?", title):
+        if token not in stopwords:
+            score[token] += 4
+    return [token for token, _ in score.most_common(limit)]
+
+
+def _extract_numbers(text: str, limit: int = 4) -> list[str]:
+    patterns = [
+        r"\d{4}년(?:\s*\d{1,2}월(?:\s*\d{1,2}일)?)?",
+        r"\d{1,3}(?:,\d{3})+(?:원|달러|명|개|건|회|위|억|만)?",
+        r"\d+(?:\.\d+)?%",
+        r"\d+(?:\.\d+)?(?:억|만|천)?(?:원|달러|명|개|건|회|위|개월|년|일)",
     ]
+    values: list[str] = []
+    for pattern in patterns:
+        values.extend(re.findall(pattern, text))
+    return _unique(values)[:limit]
+
+
+def _category_context(category: str) -> str:
     return {
-        "video_title": _short_caption(article.title, 48),
+        "연예": "인물에 대한 평가보다 확인된 일정과 공식 발언을 중심으로 보는 것이 중요합니다.",
+        "국내 이슈": "온라인 반응과 공식 확인 내용은 분리해서 살펴볼 필요가 있습니다.",
+        "해외 이슈": "해외 보도는 번역 과정에서 의미가 달라질 수 있어 원발표와 후속 보도를 함께 봐야 합니다.",
+        "경제·주식": "숫자의 크기보다 발표 시점과 실제 영향 범위를 함께 확인해야 합니다.",
+        "생활정보": "조건과 적용 대상이 사람마다 다를 수 있으므로 세부 기준 확인이 필요합니다.",
+        "제품·리뷰": "광고 문구보다 실제 사양과 사용 조건을 구분해서 보는 것이 핵심입니다.",
+    }.get(category, "확인된 사실과 해석을 구분해서 보는 것이 중요합니다.")
+
+
+def generate_zero_key_plan(article: ArticleData, duration: int, category: str) -> dict[str, Any]:
+    """외부 생성형 AI 없이 제목·핵심어·수치만 구조화해 새 대본을 만든다."""
+    title = _clean_article_title(article.title)
+    body = re.sub(r"\s+", " ", article.text or "").strip()
+    keywords = _top_keywords(body, title, 8)
+    numbers = _extract_numbers(body, 4)
+    subject = " · ".join(keywords[:2]) if keywords else _short_caption(title, 28)
+    secondary = " · ".join(keywords[2:5]) if len(keywords) >= 3 else "후속 발표와 공식 확인"
+    hooks = {
+        "연예": f"{subject}, 지금 왜 다시 주목받고 있을까요?",
+        "경제·주식": f"{subject}, 숫자보다 먼저 봐야 할 포인트가 있습니다.",
+        "제품·리뷰": f"{subject}, 광고보다 먼저 확인할 부분이 있습니다.",
+        "생활정보": f"{subject}, 나에게도 해당되는지 핵심만 짚어보겠습니다.",
+    }
+    hook = hooks.get(category, f"{subject}, 지금 핵심 쟁점은 무엇일까요?")
+    lines = [hook, f"먼저 확인되는 핵심은 {subject}와 관련된 새 소식이 전해졌다는 점입니다."]
+    if numbers:
+        lines.append(f"기사에서 눈에 띄는 구체적인 수치는 {'·'.join(numbers[:3])}입니다.")
+    lines.extend([
+        f"내용을 정리하면 {secondary}가 이번 소식의 중심 맥락으로 보입니다.",
+        _category_context(category),
+        "아직 확인되지 않은 추측은 사실처럼 단정하지 않고, 공식 발표와 후속 내용을 지켜보는 편이 안전합니다.",
+    ])
+    if duration >= 45:
+        lines.append("결국 중요한 건 자극적인 제목보다 실제로 확인된 범위와 앞으로 달라질 가능성을 함께 보는 것입니다.")
+    if duration >= 60:
+        lines.append("새로운 입장이나 정정 보도가 나오면 기존 해석도 달라질 수 있다는 점을 기억해야 합니다.")
+    lines.append("여러분은 이 소식의 핵심을 어떻게 보시나요?")
+    target_scenes = 6 if duration <= 30 else 7 if duration <= 45 else 8
+    if len(lines) > target_scenes:
+        lines = [lines[0], *lines[1:-1][:target_scenes-2], lines[-1]]
+    scenes = []
+    for idx, line in enumerate(lines):
+        caption_text = "핵심만 빠르게 정리합니다" if idx == 0 else line
+        scenes.append({
+            "caption": _short_caption(caption_text, 26),
+            "emphasis": _pick_emphasis(caption_text),
+            "narration": line,
+            "stock_keywords": " ".join(keywords[:3]),
+            "visual_note": f"{category} 주제를 상징하는 독창적인 에디토리얼 그래픽",
+        })
+    facts = [f"기사 제목: {title}"]
+    if keywords:
+        facts.append(f"핵심어: {', '.join(keywords[:5])}")
+    if numbers:
+        facts.append(f"주요 수치: {', '.join(numbers)}")
+    narration = " ".join(lines)
+    return {
+        "video_title": _short_caption(title, 48),
         "hook": hook,
         "narration": narration,
-        "description": f"{article.title}\n\n원문 출처: {article.url}",
-        "hashtags": ["#쇼츠", "#뉴스", f"#{category.replace(' ', '')}"],
-        "core_facts": selected[:3],
+        "description": f"기사에서 확인 가능한 사실과 핵심어를 바탕으로 새롭게 구성한 해설입니다.\n\n참고 출처: {article.publisher or article.url}\n{article.url}",
+        "hashtags": ["#쇼츠", "#이슈정리", f"#{category.replace(' ', '').replace('·', '')}"],
+        "core_facts": facts[:3],
+        "originality_overlap_words": _longest_shared_phrase_words(article.text, narration),
         "scenes": scenes,
     }
+
+
+def generate_local_plan(article: ArticleData, duration: int, category: str) -> dict[str, Any]:
+    return generate_zero_key_plan(article, duration, category)
+
+
+def plan_from_edited_narration(base_plan: dict[str, Any], narration: str, article: ArticleData, duration: int) -> dict[str, Any]:
+    clean = re.sub(r"\s+", " ", narration or "").strip()
+    if not clean:
+        raise ShortsMakerError("수정 대본이 비어 있습니다.")
+    parts = [part.strip() for part in re.split(r"(?<=[.!?。！？])\s+", clean) if len(part.strip()) >= 5]
+    if len(parts) < 3:
+        words = clean.split()
+        chunk_size = max(8, math.ceil(len(words) / 6))
+        parts = [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+    revised = dict(base_plan)
+    revised["narration"] = clean
+    revised["hook"] = parts[0]
+    revised["scenes"] = [{
+        "caption": _short_caption(part, 28),
+        "emphasis": _pick_emphasis(part),
+        "narration": part,
+        "stock_keywords": "",
+        "visual_note": "대본 내용에 맞춘 독창적인 에디토리얼 그래픽",
+    } for part in parts[:10]]
+    revised["originality_overlap_words"] = _longest_shared_phrase_words(article.text, clean)
+    return normalize_plan(revised, article, duration)
 
 
 def _short_caption(text: str, limit: int) -> str:
@@ -930,6 +1026,72 @@ def _draw_centered_line(
     return _measure(draw, line, font, stroke_width)[1]
 
 
+
+def _scene_theme(text: str) -> str:
+    value = (text or "").lower()
+    if re.search(r"가수|배우|아이돌|콘서트|무대|연예|방송|드라마|영화", value): return "entertainment"
+    if re.search(r"주식|경제|매출|금리|원|달러|투자|가격|분양|청약|아파트", value): return "economy"
+    if re.search(r"법원|논란|수사|재판|정책|정부|국회|규정", value): return "issue"
+    if re.search(r"휴대폰|댓글|sns|온라인|인터넷|앱", value): return "social"
+    if re.search(r"항공|공항|여행|해외|출국|입국", value): return "travel"
+    if re.search(r"제품|리뷰|출시|구매|기기|서비스", value): return "product"
+    return "general"
+
+
+def _draw_editorial_art(canvas: Image.Image, text: str, index: int, accent: tuple[int, int, int]) -> Image.Image:
+    base = canvas.convert("RGBA")
+    draw = ImageDraw.Draw(base, "RGBA")
+    width, height = base.size
+    scale = width / 720
+    cx, cy = width // 2, int(height * 0.43)
+    theme = _scene_theme(text)
+    for radius, alpha in ((210, 25), (150, 38), (90, 55)):
+        r = int(radius * scale)
+        draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=(*accent, alpha))
+    for n in range(9):
+        x = int(width * (0.08 + ((n * 0.137 + index * 0.071) % 0.84)))
+        y = int(height * (0.16 + ((n * 0.173 + index * 0.053) % 0.46)))
+        rr = int((7 + n % 3 * 5) * scale)
+        draw.ellipse((x-rr,y-rr,x+rr,y+rr), fill=(255,255,255,30))
+    if theme == "entertainment":
+        r=int(70*scale)
+        draw.ellipse((cx-r,cy-r-int(35*scale),cx+r,cy+r-int(35*scale)), fill=(248,249,255,225), outline=(*accent,255), width=max(3,int(5*scale)))
+        draw.rounded_rectangle((cx-int(34*scale),cy+int(35*scale),cx+int(34*scale),cy+int(170*scale)), radius=int(24*scale), fill=(248,249,255,225))
+        draw.line((cx,cy+int(170*scale),cx,cy+int(245*scale)), fill=(*accent,240), width=max(5,int(10*scale)))
+        draw.line((cx-int(80*scale),cy+int(245*scale),cx+int(80*scale),cy+int(245*scale)), fill=(*accent,240), width=max(5,int(10*scale)))
+    elif theme == "economy":
+        left,bottom=int(width*.22),int(height*.62)
+        for i,h in enumerate((110,170,235,315)):
+            x=left+i*int(92*scale)
+            draw.rounded_rectangle((x,bottom-int(h*scale),x+int(58*scale),bottom), radius=int(12*scale), fill=(*accent,170+i*18))
+        pts=[(int(width*.20),int(height*.58)),(int(width*.36),int(height*.50)),(int(width*.52),int(height*.53)),(int(width*.70),int(height*.34)),(int(width*.80),int(height*.28))]
+        draw.line(pts, fill=(255,255,255,235), width=max(4,int(8*scale)), joint="curve")
+    elif theme in {"issue","product"}:
+        x1,y1,x2,y2=int(width*.27),int(height*.24),int(width*.73),int(height*.64)
+        draw.rounded_rectangle((x1,y1,x2,y2), radius=int(30*scale), fill=(250,250,255,215), outline=(*accent,240), width=max(3,int(5*scale)))
+        for i in range(4):
+            yy=y1+int((85+i*58)*scale)
+            draw.rounded_rectangle((x1+int(55*scale),yy,x2-int(55*scale),yy+int(16*scale)), radius=int(8*scale), fill=(35,38,60,95))
+        draw.ellipse((x2-int(120*scale),y2-int(120*scale),x2+int(20*scale),y2+int(20*scale)), fill=(*accent,245))
+    elif theme == "social":
+        x1,y1,x2,y2=int(width*.30),int(height*.20),int(width*.70),int(height*.68)
+        draw.rounded_rectangle((x1,y1,x2,y2), radius=int(52*scale), fill=(20,24,45,210), outline=(255,255,255,190), width=max(3,int(6*scale)))
+        draw.rounded_rectangle((x1+int(25*scale),y1+int(55*scale),x2-int(25*scale),y2-int(55*scale)), radius=int(28*scale), fill=(247,248,255,225))
+        for i,w in enumerate((230,185,250)):
+            yy=y1+int((120+i*95)*scale)
+            draw.rounded_rectangle((x1+int(58*scale),yy,x1+int((58+w)*scale),yy+int(48*scale)), radius=int(24*scale), fill=(*accent,155))
+    elif theme == "travel":
+        draw.arc((int(width*.18),int(height*.20),int(width*.82),int(height*.72)), 205, 338, fill=(255,255,255,180), width=max(3,int(6*scale)))
+        pts=[(int(width*.36),int(height*.47)),(int(width*.75),int(height*.31)),(int(width*.61),int(height*.46)),(int(width*.66),int(height*.57)),(int(width*.54),int(height*.50)),(int(width*.44),int(height*.62))]
+        draw.polygon(pts, fill=(*accent,235), outline=(255,255,255,160))
+    else:
+        for i in range(3):
+            off=int(i*34*scale)
+            draw.rounded_rectangle((int(width*.22)+off,int(height*.25)+off,int(width*.74)+off,int(height*.59)+off), radius=int(36*scale), fill=(255,255,255,45+i*25), outline=(*accent,100+i*35), width=max(2,int(4*scale)))
+        draw.ellipse((cx-int(85*scale),cy-int(85*scale),cx+int(85*scale),cy+int(85*scale)), fill=(*accent,210))
+        draw.ellipse((cx-int(34*scale),cy-int(34*scale),cx+int(34*scale),cy+int(34*scale)), fill=(255,255,255,235))
+    return base
+
 def make_scene_card(
     image_path: Path | None,
     output_path: Path,
@@ -952,6 +1114,8 @@ def make_scene_card(
     scale = width / 720
     margin = int(42 * scale)
     canvas = _prepare_background(image_path, size, index, background_mode, template)
+    if image_path is None:
+        canvas = _draw_editorial_art(canvas, f"{caption} {title} {hook}", index, accent)
     canvas = _overlay_vertical_gradient(
         canvas,
         top_alpha=170 if template != "card" else 190,
@@ -962,7 +1126,7 @@ def make_scene_card(
 
     font_bold = find_font(True)
     font_regular = find_font(False)
-    source_text = _short_caption(f"출처 · {source}" if source else "기사 기반 AI 요약", 54)
+    source_text = _short_caption(f"출처 · {source}" if source else "기사 기반 자체 해설", 54)
 
     if template == "news":
         title_y = int(62 * scale)
@@ -1055,13 +1219,13 @@ def make_scene_card(
                 )
                 hook_y += int(50 * scale)
         caption_y = int(height * 0.72)
-        caption_width = width - margin * 2
+        caption_width = width - margin * 2 - int(24 * scale)
 
     caption_font, caption_lines = _fit_font_lines(
         draw,
         caption,
         font_bold,
-        int((58 if template == "highlight" else 52) * scale),
+        int((54 if template == "highlight" else 50) * scale),
         int(38 * scale),
         caption_width,
         2,
@@ -1409,7 +1573,7 @@ def render_video(
     )
     report_path = temp_root / "copyright_check_report.txt"
     report_path.write_text(
-        "쇼츠메이커 WEB V2.2 저작권 안전 점검\n\n"
+        "쇼츠메이커 CLOUD V3.0 저작권 안전 점검\n\n"
         "[대본]\n기사 원문 직접 낭독: 사용 안 함\n사실 기반 재작성: 적용\n"
         f"원문과 최장 연속 유사 어절: {int(plan.get('originality_overlap_words') or 0)}어절\n"
         "[영상]\n기사 대표 사진: 사용 안 함\n방송 캡처/타 유튜브 영상: 사용 안 함\n"
@@ -1429,7 +1593,7 @@ def render_video(
         encoding="utf-8-sig",
     )
 
-    zip_path = temp_root / "shorts_result_v22.zip"
+    zip_path = temp_root / "shorts_result_v30.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in (
             final_video, audio_path, srt_path, script_path, metadata_path, source_path,
