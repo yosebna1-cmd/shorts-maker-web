@@ -8,7 +8,6 @@ import json
 import math
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -16,9 +15,9 @@ import urllib.parse
 import wave
 import zipfile
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable
 
 import requests
 from bs4 import BeautifulSoup
@@ -53,16 +52,87 @@ VOICE_OPTIONS: dict[str, dict[str, str]] = {
     "현수 다국어 · 외래어 친화형": {"voice": "ko-KR-HyunsuMultilingualNeural", "gender": "남성"},
 }
 
+
+COPYRIGHT_SOURCE_OPTIONS = [
+    "직접 촬영/직접 제작",
+    "사용 허락을 받은 사진·영상",
+    "상업 이용이 허용된 라이선스 자료",
+    "기사·언론사 사진",
+    "연예인/공개계정 SNS 사진·캡처",
+    "방송·유튜브·타 크리에이터 영상/캡처",
+    "출처·권리관계 불명",
+]
+
+COPYRIGHT_BASIS_OPTIONS = [
+    "직접 제작하여 권리 보유",
+    "권리자로부터 상업적 사용 허락 확보",
+    "라이선스에서 상업적 이용 및 재편집 허용 확인",
+    "출처만 알고 있으며 별도 허락 없음",
+    "확인하지 못함",
+]
+
+def audit_visual_rights(source_type: str, basis: str) -> dict[str, str]:
+    """보수적 사전 필터. 법률 판단이 아니라 위험 자료의 자동 사용을 막는 안전장치."""
+    green_basis = {
+        "직접 제작하여 권리 보유",
+        "권리자로부터 상업적 사용 허락 확보",
+        "라이선스에서 상업적 이용 및 재편집 허용 확인",
+    }
+    if source_type == "직접 촬영/직접 제작" and basis == "직접 제작하여 권리 보유":
+        return {"grade": "GREEN", "label": "🟢 사용 가능", "reason": "직접 제작 자료로 표시됨"}
+    if basis in green_basis and source_type not in {"출처·권리관계 불명"}:
+        return {"grade": "GREEN", "label": "🟢 사용 가능", "reason": "상업적 사용 근거를 사용자가 확인함"}
+    if source_type in {"방송·유튜브·타 크리에이터 영상/캡처", "출처·권리관계 불명"}:
+        return {"grade": "RED", "label": "🔴 사용 제외", "reason": "무단 재사용 위험이 높거나 권리관계가 불명확함"}
+    if source_type in {"기사·언론사 사진", "연예인/공개계정 SNS 사진·캡처"}:
+        return {"grade": "YELLOW", "label": "🟡 확인 필요", "reason": "공개된 자료라도 재사용 권한이 자동으로 생기지 않음"}
+    return {"grade": "YELLOW", "label": "🟡 확인 필요", "reason": "상업적 사용·재편집 권한을 추가 확인해야 함"}
+
+
+def music_rights_audit(music_ui: str, cross_platform_confirmed: bool = False) -> dict[str, str]:
+    if music_ui == "음악 사용 안 함":
+        return {"grade": "GREEN", "label": "🟢 사용 가능", "reason": "마스터 영상에 BGM을 삽입하지 않음"}
+    if music_ui in {"콘텐츠에 맞춰 자동 추천", "내장 오리지널 중 직접 선택"}:
+        return {"grade": "GREEN", "label": "🟢 사용 가능", "reason": "프로그램 자체 오리지널 트랙 사용"}
+    if music_ui == "YouTube 오디오 라이브러리 음원 업로드":
+        if cross_platform_confirmed:
+            return {"grade": "GREEN", "label": "🟢 사용 가능", "reason": "사용자가 YouTube·네이버 양쪽 사용 조건을 확인함"}
+        return {"grade": "YELLOW", "label": "🟡 확인 필요", "reason": "YouTube용 음원의 네이버 클립 재사용 권한은 별도 확인 필요"}
+    return {"grade": "YELLOW", "label": "🟡 확인 필요", "reason": "음원 이용 조건 확인 필요"}
+
+
+def build_copyright_report(asset_rows: list[dict[str, str]], music_audit: dict[str, str], article_overlap: int = 0) -> str:
+    lines = [
+        "SHORTS MAKER V4.0 · COPYRIGHT SAFE 사전 점검",
+        "",
+        "[대본]",
+        "- 기사 사실 기반 독자적 재작성",
+        f"- 기사 원문과 최장 연속 유사 어절: {article_overlap}어절",
+        "",
+        "[시각 자료]",
+    ]
+    if not asset_rows:
+        lines.append("- 사용자 실제 자료 없음 · 최종 렌더러는 승인 자료만 사용 권장")
+    for row in asset_rows:
+        lines.append(f"- {row['label']} {row['name']} | {row['source_type']} | {row['reason']}")
+    lines += ["", "[음악]", f"- {music_audit['label']} {music_audit['reason']}", ""]
+    blocked = [r for r in asset_rows if r['grade'] != 'GREEN']
+    lines.append("[판정]")
+    if blocked or music_audit['grade'] != 'GREEN':
+        lines.append("- ⚠️ 확인 필요/사용 제외 자료는 최종 영상에 자동 삽입하지 않습니다.")
+    else:
+        lines.append("- ✅ 등록된 자료 기준 사전 필터 통과")
+    lines.append("- 이 검사는 위험을 줄이는 보수적 사전 필터이며 법적 무침해를 보증하지 않습니다.")
+    return "\n".join(lines) + "\n"
+
 RATE_OPTIONS = {
     "보통": "+0%",
     "조금 빠르게": "+8%",
-    "시그니처 추천": "+13%",
     "쇼츠 추천": "+15%",
     "매우 빠르게": "+22%",
 }
 
 TEMPLATE_OPTIONS = {
-    "엔터 밝은 인물형 · 연예 쇼츠 추천": "entertainment_bright",
     "자막 강조형 · 요즘 쇼츠 추천": "highlight",
     "뉴스형 · 깔끔하고 신뢰감": "news",
     "카드형 · 정보 정리형": "card",
@@ -87,13 +157,6 @@ BACKGROUND_MODE_OPTIONS = {
     "블러 배경 + 원본": "blur",
 }
 
-STICKER_STYLE_OPTIONS = {
-    "사용 안 함": "none",
-    "샤갈 · 레드 임팩트": "shocking_red",
-    "긴장되는 순간 · 다크 타이포": "tension_black",
-    "히트 · 스피드라인": "hit_burst",
-}
-
 RESOLUTION_OPTIONS = {
     "720×1280 · 빠른 제작": (720, 1280),
     "1080×1920 · 고화질": (1080, 1920),
@@ -105,27 +168,6 @@ VOICE_PRESET_OPTIONS = {
     "밝고 듣기 좋게": "bright",
     "재밌고 경쾌하게": "fun",
     "차분하고 따뜻하게": "warm",
-}
-
-# 업로드된 3개 음성은 원본을 저장하거나 복제하지 않고, 음높이·밝기·속도 같은
-# 비식별 음향 특성만 분석해 아래 프리셋을 설계했습니다.
-VOICE_REFERENCE_PROFILE = {
-    "user_median_f0_hz": 129.9,
-    "male_reference_f0_hz": 99.6,
-    "female_reference_f0_hz": 224.8,
-    "user_spectral_centroid_hz": 1136.8,
-    "male_spectral_centroid_hz": 1617.4,
-    "female_spectral_centroid_hz": 1689.8,
-}
-
-VOICE_PERSONA_OPTIONS = {
-    "윤영 단독 시그니처 · 맑고 안정적인 톤": "yoonyoung_signature",
-    "윤영×남성 저음 믹스 · 선택형 하이브리드": "yoonyoung_male_hybrid",
-    "에덤이 스타일 · 요즘 유행하는 트렌디 남성톤": "adam_trendy",
-    "여성 참고음성 A · 빠르고 밝은 톤 (남성 레이어 없음)": "female_reference_signature",
-    "여성 참고음성 B · 부드럽고 맑은 톤 (남성 레이어 없음)": "female_reference_soft",
-    "AI 성우 중 직접 선택": "standard",
-    "내 목소리 직접 녹음·보정": "recorded",
 }
 
 MUSIC_TRACK_OPTIONS = {
@@ -146,17 +188,6 @@ MUSIC_AUTO_BY_CATEGORY = {
     "제품·리뷰": "제품·리뷰 업비트",
 }
 
-TITLE_STYLE_OPTIONS = [
-    "초강력 후킹형 · 사실 기반 자극형",
-    "강한 후킹형 · 클릭 유도",
-    "균형형 · 주목도와 신뢰감",
-    "정보형 · 과장 최소화",
-]
-
-TITLE_BANNED_WORDS = {
-    "충격", "소름", "역대급", "무조건", "100%", "대박", "레전드", "실화냐", "미쳤다",
-}
-
 
 @dataclass
 class ArticleData:
@@ -166,21 +197,6 @@ class ArticleData:
     published_date: str
     text: str
     images: list[str]
-    license_urls: list[str] = field(default_factory=list)
-    page_author: str = ""
-
-
-@dataclass
-class LicensedVisual:
-    title: str
-    image_url: str
-    thumb_url: str
-    page_url: str
-    author: str
-    license_short: str
-    license_url: str
-    credit: str
-    source: str = "Wikimedia Commons"
 
 
 class ShortsMakerError(RuntimeError):
@@ -356,35 +372,6 @@ def fetch_article(url: str, timeout: int = 25) -> ArticleData:
         if absolute.startswith("http"):
             normalized_images.append(absolute)
 
-    license_urls: list[str] = []
-    for link in soup.find_all("link"):
-        rel = [str(x).lower() for x in (link.get("rel") or [])]
-        href = str(link.get("href") or "").strip()
-        if "license" in rel and href:
-            license_urls.append(urllib.parse.urljoin(url, href))
-    for meta in soup.find_all("meta"):
-        key = str(meta.get("name") or meta.get("property") or "").lower()
-        content = str(meta.get("content") or "").strip()
-        if content and key in {"license", "dc.rights", "dcterms.license", "copyright"}:
-            license_urls.append(content)
-    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        try:
-            parsed_json = json.loads(tag.string or tag.get_text())
-        except Exception:
-            continue
-        for obj in _walk_json(parsed_json):
-            license_value = obj.get("license")
-            if isinstance(license_value, str):
-                license_urls.append(license_value)
-            elif isinstance(license_value, list):
-                license_urls.extend(str(x) for x in license_value if x)
-    page_author = _meta_content(
-        soup,
-        ("name", "author"),
-        ("property", "article:author"),
-        ("name", "byl"),
-    )
-
     return ArticleData(
         url=url,
         title=re.sub(r"\s+", " ", title).strip(),
@@ -392,8 +379,6 @@ def fetch_article(url: str, timeout: int = 25) -> ArticleData:
         published_date=published_date.strip(),
         text=body,
         images=_unique(normalized_images)[:15],
-        license_urls=_unique(license_urls)[:10],
-        page_author=page_author.strip(),
     )
 
 
@@ -634,295 +619,186 @@ def _category_context(category: str) -> str:
     }.get(category, "확인된 사실과 해석을 구분해서 보는 것이 중요합니다.")
 
 
-
-def _strip_korean_josa(token: str) -> str:
-    token = re.sub(r"[\"'“”‘’()\[\]{}]", "", token or "").strip()
-    for josa in ("에게서는", "으로부터", "에서는", "에게서", "한테서", "으로는", "로서는", "까지는", "부터는", "이라는", "라는", "에게", "한테", "께서", "으로", "에서", "부터", "까지", "처럼", "보다", "하고", "이며", "이나", "거나", "은", "는", "이", "가", "을", "를", "의", "도", "만", "와", "과", "로"):
-        if len(token) >= len(josa) + 2 and token.endswith(josa):
-            token = token[:-len(josa)]
-            break
-    return token.strip()
-
-
-def _has_final_consonant(word: str) -> bool:
-    if not word:
-        return False
-    code = ord(word[-1])
-    if 0xAC00 <= code <= 0xD7A3:
-        return (code - 0xAC00) % 28 != 0
-    return False
+def _v40_role(idx: int, total: int) -> str:
+    if idx == 0: return "HOOK"
+    if idx <= max(1, total // 4): return "SETUP"
+    if idx <= max(2, total // 2): return "REVEAL"
+    if idx < total - 2: return "REACTION"
+    if idx == total - 2: return "PAYOFF"
+    return "QUESTION"
 
 
-def _object_particle(word: str) -> str:
-    return "을" if _has_final_consonant(word) else "를"
+def _v40_pacing_report(plan: dict[str, Any], duration: int) -> dict[str, Any]:
+    scenes = plan.get("scenes") or []
+    n = max(1, len(scenes))
+    avg = float(duration) / n
+    warnings = []
+    score = 100
+    if n < 9:
+        warnings.append(f"컷이 {n}개뿐입니다. 연예 쇼츠는 9~16컷을 권장합니다.")
+        score -= 22
+    if avg > 3.0:
+        warnings.append(f"컷당 평균 {avg:.1f}초로 느립니다. 1~2.5초대 화면 변화를 권장합니다.")
+        score -= 20
+    hook = str(plan.get("hook") or "")
+    if len(hook) > 38:
+        warnings.append("첫 후킹 문장이 깁니다. 첫 2초 안에 읽히도록 더 짧게 줄이세요.")
+        score -= 12
+    captions = [str(x.get("caption") or "") for x in scenes if isinstance(x, dict)]
+    if captions and sum(len(c) > 24 for c in captions) >= max(2, n // 3):
+        warnings.append("긴 화면 자막이 많습니다. 한 컷 한 메시지 원칙으로 줄이는 편이 좋습니다.")
+        score -= 12
+    if scenes and "?" not in str(scenes[-1].get("narration") or ""):
+        warnings.append("마지막 댓글 유도 질문이 약합니다.")
+        score -= 8
+    return {"score": max(0, score), "avg_cut": avg, "warnings": warnings}
 
 
-def _and_particle(word: str) -> str:
-    return "과" if _has_final_consonant(word) else "와"
+def _v40_entertainment_plan(article: ArticleData, duration: int, category: str) -> dict[str, Any]:
+    """V4.0 entertainment story engine.
 
-
-def _title_subject(title: str, keywords: list[str]) -> str:
-    """'이탁수는 배우'처럼 조사·직업이 붙은 구절에서 실제 핵심 인물만 추출한다."""
-    clean_title = _clean_article_title(title)
-    clean_title = re.sub(r"^\s*\[[^\]]{1,20}\]\s*", "", clean_title)
-    clean_title = re.sub(r"^\s*[【〔(][^】〕)]{1,20}[】〕)]\s*", "", clean_title)
-    clean_title = re.sub(r"[\r\n]+", " ", clean_title).strip()
-
-    first_clause = re.split(r"\s*(?:,|…|\.{2,}|｜|\||:|=)\s*", clean_title, maxsplit=1)[0]
-    first_clause = re.sub(r"^[\"'“”‘’]+|[\"'“”‘’]+$", "", first_clause).strip()
-    first_clause = re.sub(r"\s+", " ", first_clause)
-
-    # '이탁수는 배우', '홍길동 배우', '김OO의 아들' 같은 문구에서 이름 우선 추출
-    name_match = re.match(
-        r"^([가-힣]{2,4}?)(?:은|는|이|가|도|만|의)?(?:\s+)(?:배우|가수|방송인|모델|연예인|개그맨|코미디언|아들|딸|부친|모친|남편|아내)(?:\b|\s|$)",
-        first_clause,
-    )
-    if name_match:
-        return name_match.group(1)
-
-    parts = first_clause.split()
-    if parts:
-        first = _strip_korean_josa(parts[0])
-        if re.fullmatch(r"[가-힣]{2,4}", first):
-            return first
-
-    generic_only = {"단독", "공식", "종합", "이슈", "연예", "뉴스", "오늘", "속보", "배우", "가수", "방송인"}
-    preferred = []
-    for word in keywords:
-        clean = _strip_korean_josa(word)
-        if re.fullmatch(r"\d+(?:[.,]\d+)?%?", clean) or clean in generic_only:
-            continue
-        preferred.append(clean)
-    if preferred:
-        subject = preferred[0]
-    else:
-        subject = _short_caption(clean_title, 20)
-    subject = re.sub(r"\s+", " ", subject).strip(" -|｜·,:;")
-    return _short_caption(subject or "오늘의 이슈", 20)
-
-
-def _detect_title_event(title: str, body: str, category: str) -> str:
-    source = f"{title} {body}"
-    patterns = [
-        (r"배우\s*(?:데뷔|변신|도전)|연기\s*(?:데뷔|도전)|배우로\s*(?:데뷔|변신)", "배우 변신"),
-        (r"사진\s*공개|근황\s*공개|SNS\s*공개|인스타\s*공개", "근황 공개"),
-        (r"컴백|신곡|앨범|음원\s*공개", "컴백 소식"),
-        (r"캐스팅|출연\s*확정|합류", "출연 소식"),
-        (r"열애|연애|결혼", "열애·결혼 소식"),
-        (r"이혼|결별|파경", "결별 소식"),
-        (r"입대|군입대|전역", "군 복무 근황"),
-        (r"복귀|활동\s*재개", "복귀 소식"),
-        (r"해명|반박|입장문|공식\s*입장", "공식 입장"),
-        (r"사과|사과문", "사과 내용"),
-        (r"논란|의혹|갑론을박", "논란의 핵심"),
-        (r"수상|대상|1위", "뜻밖의 결과"),
-        (r"급등|급락|상한가|하한가", "가격 급변"),
-        (r"실적|매출|영업이익", "실적 발표"),
-        (r"출시|공개|발표", "새 발표"),
-    ]
-    for pattern, label in patterns:
-        if re.search(pattern, source, flags=re.I):
-            return label
-    if category == "연예":
-        return "새 근황"
-    if category == "경제·주식":
-        return "숫자 뒤의 배경"
-    if category == "제품·리뷰":
-        return "실사용 핵심"
-    return "이번 소식"
-
-
-def _headline_keyword(title: str, body: str) -> str:
-    source = f"{title} {body}"
-    candidates = [
-        "배우", "컴백", "결혼", "열애", "이혼", "복귀", "출연", "캐스팅", "입대", "전역",
-        "해명", "반박", "사과", "논란", "의혹", "1위", "급등", "급락", "출시", "발표",
-    ]
-    for keyword in candidates:
-        if keyword in source:
-            return keyword
-    return "근황"
-
-def _impactful_title_numbers(numbers: list[str]) -> list[str]:
-    """날짜처럼 클릭 제목에서 의미가 약한 숫자를 빼고 금액·비율·순위 등만 남긴다."""
-    result: list[str] = []
-    for value in numbers:
-        value = str(value).strip()
-        if not value:
-            continue
-        if re.fullmatch(r"\d{4}년(?:\s*\d{1,2}월(?:\s*\d{1,2}일)?)?", value):
-            continue
-        if re.fullmatch(r"\d{1,2}(?:일|월|년)", value):
-            continue
-        if re.search(r"%|원|달러|억|천만|백만|만|명|개|건|회|위|배", value):
-            result.append(value)
-    return _unique(result)[:3]
-
-
-def _title_score(title: str, subject: str, numbers: list[str], style: str) -> int:
-    score = 0
-    length = len(title)
-    if 20 <= length <= 39:
-        score += 30
-    elif 16 <= length <= 44:
-        score += 18
-    else:
-        score -= abs(length - 29)
-    if subject and subject in title:
-        score += 18
-    if any(number in title for number in numbers):
-        score += 9
-    for phrase in (
-        "도대체 무슨 일", "관심 쏠린 이유", "다시 보게 된 이유", "진짜 포인트", "한마디에",
-        "전혀 다른 근황", "공개된 한 장", "평소와 다른 근황", "팬들이 멈춰 본", "반응이 커진", "갑자기", "결국", "왜 다들", "이유는", "무슨 일이",
-    ):
-        if phrase in title:
-            score += 8
-    if "…" in title:
-        score += 7
-    if "?" in title:
-        score += 5
-    if "초강력" in style:
-        score += sum(5 for phrase in ("…", "?", "갑자기", "왜", "도대체", "결국") if phrase in title)
-    elif style.startswith("정보형"):
-        score += sum(4 for phrase in ("핵심 정리", "확인된 사실", "30초") if phrase in title)
-        score -= sum(4 for phrase in ("도대체", "갑자기", "결국") if phrase in title)
-    if any(word in title for word in TITLE_BANNED_WORDS):
-        score -= 80
-    if re.search(r"(?:는|은|이|가)\s+(?:배우|가수|방송인)(?:,|$)", title):
-        score -= 45
-    return score
-
-
-def generate_attention_titles(
-    article: ArticleData,
-    category: str,
-    keywords: list[str] | None = None,
-    numbers: list[str] | None = None,
-    style: str = "초강력 후킹형 · 사실 기반 자극형",
-) -> list[str]:
-    """원문에 없는 사건은 만들지 않되, 질문·대조·말줄임표를 이용해 강한 클릭 제목을 만든다."""
-    clean_title = _clean_article_title(article.title)
+    Instead of mechanically summarizing the article, build a short-form story around
+    consequence -> origin -> incident -> backlash -> response -> second consequence -> question.
+    This is intentionally optimized for entertainment/news controversy and viral-story articles.
+    """
+    title = _clean_article_title(article.title)
     body = re.sub(r"\s+", " ", article.text or "").strip()
-    keywords = keywords or _top_keywords(body, clean_title, 10)
-    numbers = numbers or _extract_numbers(body, 4)
-    title_numbers = _impactful_title_numbers(numbers)
-    subject = _title_subject(clean_title, keywords)
-    event = _detect_title_event(clean_title, body, category)
-    headline_word = _headline_keyword(clean_title, body)
-    source_text = f"{clean_title} {body}"
+    sentences = _split_sentences(body)
 
-    ultra = [
-        f"{subject}, 갑자기 {event}? 지금 관심 쏠린 이유",
-        f"“정말 {headline_word}?” {subject} 근황에 시선 쏠린 이유",
-        f"{subject}, {event}…도대체 무슨 일이 있었나",
-        f"{subject}, 모두가 다시 보게 된 진짜 포인트",
-        f"{subject} 근황, 기사 한 줄만 보면 놓치는 반전",
-        f"{subject}, ‘{headline_word}’ 한마디에 분위기가 달라졌다",
-        f"왜 다들 {subject}{_object_particle(subject)} 다시 검색할까? 핵심은 이것",
-        f"{subject}, 알려진 모습과 전혀 다른 새 근황",
-    ]
-    strong = [
-        f"{subject}, {event} 뒤에 숨은 진짜 포인트",
-        f"{subject}, 지금 관심이 쏠린 결정적 이유",
-        f"{subject} 근황, 모두가 놓친 한 가지",
-        f"{subject}, 기사 제목보다 중요한 핵심은 따로 있었다",
-        f"{subject}, 왜 다시 주목받고 있을까?",
-        f"{subject}, 지금 꼭 확인해야 할 변화",
-    ]
-    balanced = [
-        f"{subject}, 사람들이 주목하는 이유를 정리했습니다",
-        f"{subject} 소식의 핵심, 30초 안에 정리",
-        f"{subject}, 놓치기 쉬운 핵심 포인트",
-        f"{subject}, 현재까지 확인된 내용은 여기까지",
-        f"{subject}, 지금 알아야 할 핵심 한 가지",
-        f"{subject} 소식은 왜 다시 주목받고 있을까요?",
-    ]
-    factual = [
-        f"{subject} 핵심 정리, 확인된 사실만 봤습니다",
-        f"{subject} 소식 30초 요약",
-        f"{subject}, 공식 내용과 추측을 구분해 봤습니다",
-        f"{subject} 관련 확인된 핵심 포인트",
-        f"{subject} 소식에서 꼭 알아야 할 내용",
-        f"{subject}, 기사 핵심만 빠르게 정리",
-    ]
+    def pick(*terms: str, exclude: tuple[str, ...] = ()) -> str:
+        ranked: list[tuple[int, int, str]] = []
+        for idx, sentence in enumerate(sentences):
+            if any(x in sentence for x in exclude):
+                continue
+            score = sum(3 if term in sentence else 0 for term in terms)
+            if score:
+                ranked.append((score, -idx, sentence))
+        return max(ranked, default=(0, 0, ""))[2]
 
-    if "초강력" in style:
-        candidates = list(ultra)
-    elif style.startswith("강한"):
-        candidates = list(strong)
-    elif style.startswith("정보형"):
-        candidates = list(factual)
+    # Named people: title patterns are more reliable than raw frequency because words such as
+    # '아내', '논란', 'SNS' otherwise rise to the top of simple keyword extraction.
+    m_primary = re.search(r"([가-힣]{2,4})\s*(?:논란|사건|사고|의혹)", title)
+    m_secondary = re.search(r"(?:아내|남편|배우자|연인|멤버)\s*([가-힣]{2,4})", title)
+    primary = m_primary.group(1) if m_primary else ""
+    secondary = m_secondary.group(1) if m_secondary else ""
+    if not primary:
+        candidates = [x for x in _top_keywords(body, title, 12)
+                      if x not in {"아내", "남편", "논란", "사고", "SNS", "영상", "최근", "기사"}]
+        primary = candidates[0] if candidates else "당사자"
+    if not secondary:
+        m = re.search(r"(?:아내|남편|배우자|연인)\s*([가-힣]{2,4})", body)
+        secondary = m.group(1) if m else "가족"
+
+    def topic_particle(word: str) -> str:
+        if not word or word == "가족":
+            return "은"
+        last = ord(word[-1]) - 0xAC00
+        return "은" if 0 <= last <= 11171 and last % 28 else "는"
+
+    origin = pick("시작됐", "시작되", "발생", "지난 14일", "KTX")
+    incident = pick("휠체어", "하차", "넘어", "경사로")
+    upload = pick("CCTV", "유튜브", "올렸다", "공개")
+    criticism = pick("비판", "지적", "특정 개인", "공개적인 콘텐츠")
+    exposure = pick("노출", "도와", "사회복무요원")
+    apology = pick("삭제", "사과", "고개를 숙")
+    spillover = pick(secondary, "SNS", "악성 댓글", "2차 피해", "비난의 화살")
+    unrelated = pick("직접적인 관련", "무관", "단지", "아내라는 이유")
+
+    # Short, spoken lines. Article sentences are used only to find facts; narration is newly written.
+    if secondary != "가족":
+        hook = f"{primary} 논란의 불똥이 결국 {secondary}에게까지 튀었습니다."
     else:
-        candidates = list(balanced)
+        hook = f"{primary} 논란의 불똥이 결국 가족에게까지 번졌습니다."
 
-    if title_numbers:
-        number = title_numbers[0]
-        candidates = [
-            f"{subject}, {number}까지…숫자보다 더 놀라운 핵심",
-            f"{number} 언급된 {subject}, 도대체 무슨 일?",
-            *candidates,
-        ]
-    if re.search(r"사진|근황|공개|SNS|인스타|화보", source_text, flags=re.I):
-        photo_titles = [
-            f"{subject}, 공개된 한 장에 시선 집중…무슨 일이?",
-            f"{subject}, 평소와 다른 근황…왜 다시 주목받나",
-            f"{subject}, 이 모습 공개되자 관심 쏠린 이유",
-        ]
-        candidates = [*photo_titles, *candidates]
-    if re.search(r"팬|반응|화제|관심", source_text):
-        candidates = [
-            f"{subject}, 팬들이 멈춰 본 결정적 포인트",
-            f"{subject}, 반응이 커진 진짜 이유는 따로 있었다",
-            *candidates,
-        ]
-    if re.search(r"논란|의혹|갑론을박|비판|갈등", source_text):
-        candidates = [
-            f"{subject} 논란, 결국 사람들이 따지는 핵심은 이것",
-            f"{subject} 의혹…확인된 사실은 어디까지일까?",
-            *candidates,
-        ]
-    if re.search(r"해명|반박|사과|입장", source_text):
-        candidates.insert(0, f"{subject}, 공식 입장 한마디에 분위기 달라졌다")
-    if re.search(r"결혼|열애|이혼|결별|복귀|컴백|출연|캐스팅|데뷔", source_text):
-        candidates.insert(0, f"{subject}, 갑자기 {event}? 사람들이 놀란 이유")
-    if re.search(r"급등|급락|상승|하락|주가|실적", source_text):
-        candidates = [f"{subject}, 숫자 움직이자 모두가 다시 본 한 가지", f"{subject}, 급변 뒤에 숨은 진짜 배경", *candidates]
+    lines: list[tuple[str, str, str]] = [
+        ("HOOK", hook, f"{secondary if secondary != '가족' else primary} 얼굴 클로즈업 → {primary}로 0.6초 퀵컷, '왜 여기까지?' 대형 타이포"),
+        ("SETUP", "시작은 지난 14일 KTX에서 벌어진 사고였습니다.", "KTX 외관/승강장 느낌 자료 + '8월 14일' 날짜 타이포"),
+        ("SETUP", f"하차하던 {primary}의 휠체어가 경사로 쪽에서 걸리며 앞으로 넘어졌습니다.", "휠체어 바퀴·경사로를 실루엣/도식으로 2컷 분할"),
+        ("REVEAL", f"이후 {primary}는 사고 당시 CCTV 영상을 자신의 채널에 공개했습니다.", "CCTV 프레임 모션 + PLAY 아이콘, 실제 CCTV 재현은 하지 않음"),
+        ("REVEAL", "그런데 영상이 공개된 뒤 여론은 예상과 다른 방향으로 움직였습니다.", "화면 순간 정지 → '그런데' 대형 자막 → 댓글 카드 전환"),
+        ("REACTION", "이미 사과한 도움 인력의 실수를 공개 콘텐츠로 다룬 게 적절했냐는 비판이 나온 겁니다.", "'이미 사과' / '공개 콘텐츠' 키워드 교차 타이포"),
+        ("REACTION", "도움을 주던 사람의 모습이 그대로 노출된 점도 지적됐습니다.", "사람 실루엣을 모자이크 처리한 그래픽 + 경고 아이콘"),
+        ("PAYOFF", f"결국 {primary}는 해당 영상을 삭제했습니다.", "DELETE 버튼 애니메이션 + 화면 암전"),
+        ("PAYOFF", "그리고 전달 방식이 미숙했고 생각이 짧았다며 사과했습니다.", "사과문 느낌 카드, 핵심 문구만 짧게 표시"),
+        ("REVEAL", "여기서 논란이 일단락되는 듯했는데요.", "BGM 다운 구간 + 0.4초 블랙 프레임"),
+        ("REVEAL", "문제는 그다음이었습니다.", "'그다음' 한 단어를 크게 띄우고 빠른 HIT 전환"),
+        ("REACTION", f"비난이 이번 일과 직접 관련 없는 {secondary}의 SNS까지 번졌습니다.", f"{secondary} 이름 + SNS 피드 형태 그래픽, 댓글은 흐림 처리"),
+        ("REACTION", f"{secondary}{topic_particle(secondary)} 단지 {primary}의 가족이라는 이유로 공격받는 상황이 된 겁니다.", "두 인물 이름 사이 화살표 → 빨간 X로 '연좌 비난' 차단 표현"),
+        ("REACTION", "사건과 무관한 과거 활동까지 끌어온 비난도 이어졌다고 전해졌습니다.", "과거/현재 카드가 섞이는 효과 후 '관련 없음' 스탬프"),
+        ("PAYOFF", f"{primary}에 대한 비판과 {secondary}에게 향한 공격은 구분해서 볼 필요가 있습니다.", "좌우 분할: '당사자 비판' vs '가족 공격' 비교 카드"),
+        ("QUESTION", "여러분은 어디까지가 정당한 비판이라고 보시나요?", "두 선택지 카드 + 댓글 아이콘으로 종료"),
+    ]
 
-    cleaned: list[str] = []
-    for candidate in candidates:
-        candidate = re.sub(r"\s+", " ", candidate).strip(" -|｜")
-        if not candidate or any(word in candidate for word in TITLE_BANNED_WORDS):
-            continue
-        candidate = re.sub(r"([가-힣]{2,4})(?:은|는)\s+배우,", r"\1,", candidate)
-        if len(candidate) > 46:
-            candidate = _short_caption(candidate, 44)
-        if candidate not in cleaned:
-            cleaned.append(candidate)
+    target = 12 if duration <= 30 else 14 if duration <= 35 else 16 if duration <= 40 else 18 if duration <= 45 else 20
+    # For longer durations add context beats without slowing any single visual beat.
+    extras = [
+        ("SETUP", f"{primary}는 사고 상황을 알리려는 취지로 영상을 올렸지만, 공개 방식 자체가 쟁점이 됐습니다.", "의도/방식 2분할 카드"),
+        ("REACTION", "온라인 반응이 커지면서 사고 자체보다 공개 방식에 대한 논쟁이 중심이 됐습니다.", "사고 → 공개 방식으로 초점이 이동하는 화살표 그래픽"),
+        ("PAYOFF", "당사자가 사과한 뒤에도 비난이 다른 사람에게 이동하면서 또 다른 문제가 생겼습니다.", "사과 카드에서 SNS 댓글 카드로 빠르게 슬라이드"),
+        ("QUESTION", "비판의 대상과 범위를 구분해야 한다는 지적이 나오는 이유입니다.", "대상/범위 키워드 체크 그래픽"),
+    ]
+    if target > len(lines):
+        # Insert extra beats before the final question.
+        needed = target - len(lines)
+        lines = lines[:-1] + extras[:needed] + [lines[-1]]
+    elif target < len(lines):
+        # Preserve all crucial beats while trimming secondary reaction beats first.
+        removable = {13, 6, 2, 9}
+        kept = [x for i, x in enumerate(lines) if i not in removable]
+        lines = kept[:target-1] + [lines[-1]] if len(kept) >= target else lines[:target-1] + [lines[-1]]
 
-    cleaned.sort(key=lambda item: _title_score(item, subject, title_numbers, style), reverse=True)
-    return cleaned[:8] or [_short_caption(clean_title, 42)]
+    keywords = _unique([primary, secondary, "KTX", "CCTV", "SNS", "사과", "논란"])
+    scenes: list[dict[str, Any]] = []
+    for role, narration, visual in lines:
+        caption = _short_caption(narration, 18 if role == "HOOK" else 22)
+        scenes.append({
+            "caption": caption,
+            "emphasis": _pick_emphasis(caption),
+            "narration": narration,
+            "stock_keywords": " ".join(keywords[:5]),
+            "visual_note": visual,
+            "role": role,
+        })
 
-def generate_zero_key_plan(article: ArticleData, duration: int, category: str, title_style: str = "초강력 후킹형 · 사실 기반 자극형") -> dict[str, Any]:
+    narration = " ".join(x[1] for x in lines)
+    safe_title = f"{primary} 논란, 왜 {secondary}에게까지 번졌나" if secondary != "가족" else f"{primary} 논란, 왜 가족에게까지 번졌나"
+    facts = [
+        f"기사 제목: {title}",
+        f"핵심 인물: {primary}" + (f", {secondary}" if secondary != "가족" else ""),
+    ]
+    for label, fact in (("사고", origin or incident), ("영상 공개", upload), ("비판", criticism or exposure), ("사과", apology), ("2차 피해", spillover or unrelated)):
+        if fact:
+            facts.append(f"{label}: {_short_caption(fact, 70)}")
+
+    return {
+        "video_title": safe_title,
+        "hook": hook,
+        "narration": narration,
+        "description": f"공개 기사에 확인된 사실을 바탕으로 사건 흐름을 재구성한 쇼츠입니다.\n\n참고 출처: {article.publisher or article.url}\n{article.url}",
+        "hashtags": ["#쇼츠", "#연예뉴스", f"#{primary}"] + ([f"#{secondary}"] if secondary != "가족" else []),
+        "core_facts": facts,
+        "originality_overlap_words": _longest_shared_phrase_words(article.text, narration),
+        "scenes": scenes,
+    }
+
+def generate_zero_key_plan(article: ArticleData, duration: int, category: str) -> dict[str, Any]:
     """외부 생성형 AI 없이 제목·핵심어·수치만 구조화해 새 대본을 만든다."""
+    if category in {"연예", "아이돌", "배우", "예능", "드라마·영화"}:
+        return _v40_entertainment_plan(article, duration, category)
     title = _clean_article_title(article.title)
     body = re.sub(r"\s+", " ", article.text or "").strip()
     keywords = _top_keywords(body, title, 8)
     numbers = _extract_numbers(body, 4)
-    person_candidates = _person_subject_candidates(title, body)
-    subject = person_candidates[0] if person_candidates else _title_subject(title, keywords)
-    event = _detect_title_event(title, body, category)
-    generic_secondary = {"새로운", "근황", "가수", "배우", "사진", "공개", "관심", "팬들", "화제", subject}
-    secondary_keywords = [word for word in keywords if word not in generic_secondary]
-    secondary = " · ".join(secondary_keywords[:3]) if secondary_keywords else event
+    subject = " · ".join(keywords[:2]) if keywords else _short_caption(title, 28)
+    secondary = " · ".join(keywords[2:5]) if len(keywords) >= 3 else "후속 발표와 공식 확인"
     hooks = {
-        "연예": f"{subject}, {event} 소식이 왜 이렇게 주목받고 있을까요?",
+        "연예": f"{subject}, 지금 왜 다시 주목받고 있을까요?",
         "경제·주식": f"{subject}, 숫자보다 먼저 봐야 할 포인트가 있습니다.",
         "제품·리뷰": f"{subject}, 광고보다 먼저 확인할 부분이 있습니다.",
         "생활정보": f"{subject}, 나에게도 해당되는지 핵심만 짚어보겠습니다.",
     }
     hook = hooks.get(category, f"{subject}, 지금 핵심 쟁점은 무엇일까요?")
-    lines = [hook, f"먼저 확인되는 핵심은 {subject}{_and_particle(subject)} 관련된 새 소식이 전해졌다는 점입니다."]
+    lines = [hook, f"먼저 확인되는 핵심은 {subject}와 관련된 새 소식이 전해졌다는 점입니다."]
     if numbers:
         lines.append(f"기사에서 눈에 띄는 구체적인 수치는 {'·'.join(numbers[:3])}입니다.")
     lines.extend([
@@ -954,11 +830,8 @@ def generate_zero_key_plan(article: ArticleData, duration: int, category: str, t
     if numbers:
         facts.append(f"주요 수치: {', '.join(numbers)}")
     narration = " ".join(lines)
-    title_candidates = generate_attention_titles(article, category, keywords, numbers, title_style)
     return {
-        "video_title": title_candidates[0],
-        "title_candidates": title_candidates,
-        "title_style": title_style,
+        "video_title": _short_caption(title, 48),
         "hook": hook,
         "narration": narration,
         "description": f"기사에서 확인 가능한 사실과 핵심어를 바탕으로 새롭게 구성한 해설입니다.\n\n참고 출처: {article.publisher or article.url}\n{article.url}",
@@ -1036,6 +909,7 @@ def normalize_plan(plan: dict[str, Any], article: ArticleData, duration: int) ->
                     "narration": narration,
                     "stock_keywords": str(scene.get("stock_keywords") or "").strip(),
                     "visual_note": str(scene.get("visual_note") or "").strip(),
+                    "role": str(scene.get("role") or "").strip(),
                 }
             )
     if len(scenes) < 3:
@@ -1050,21 +924,15 @@ def normalize_plan(plan: dict[str, Any], article: ArticleData, duration: int) ->
     if isinstance(hashtags, str):
         hashtags = re.findall(r"#\S+", hashtags) or [hashtags]
 
-    title_candidates = [str(x).strip() for x in (plan.get("title_candidates") or []) if str(x).strip()]
-    selected_title = str(plan.get("video_title") or article.title).strip()
-    if selected_title and selected_title not in title_candidates:
-        title_candidates.insert(0, selected_title)
     return {
-        "video_title": selected_title,
-        "title_candidates": title_candidates[:8] or [selected_title],
-        "title_style": str(plan.get("title_style") or "초강력 후킹형 · 사실 기반 자극형"),
+        "video_title": str(plan.get("video_title") or article.title).strip(),
         "hook": str(plan.get("hook") or scenes[0]["narration"]).strip(),
         "narration": narration,
         "description": str(plan.get("description") or f"원문 출처: {article.url}").strip(),
         "hashtags": [str(tag).strip() for tag in hashtags if str(tag).strip()],
         "core_facts": [str(x).strip() for x in (plan.get("core_facts") or []) if str(x).strip()][:3],
         "originality_overlap_words": int(plan.get("originality_overlap_words") or 0),
-        "scenes": scenes[:10],
+        "scenes": scenes[:16],
     }
 
 
@@ -1076,25 +944,12 @@ def _run_async(coro: Any) -> Any:
         loop.close()
 
 
-def synthesize_edge_tts(
-    text: str,
-    voice: str,
-    rate: str,
-    output_path: Path,
-    pitch: str = "+0Hz",
-    volume: str = "+0%",
-) -> str:
+def synthesize_edge_tts(text: str, voice: str, rate: str, output_path: Path) -> str:
     if edge_tts is None:
         raise ShortsMakerError("edge-tts 모듈이 설치되지 않았습니다.")
 
     async def _save(selected_voice: str) -> None:
-        communicate = edge_tts.Communicate(
-            text=text,
-            voice=selected_voice,
-            rate=rate,
-            pitch=pitch,
-            volume=volume,
-        )
+        communicate = edge_tts.Communicate(text=text, voice=selected_voice, rate=rate)
         await communicate.save(str(output_path))
 
     candidates = _unique([voice, "ko-KR-SunHiNeural", "ko-KR-InJoonNeural"])
@@ -1107,173 +962,6 @@ def synthesize_edge_tts(
         except Exception as exc:
             errors.append(f"{candidate}: {exc}")
     raise ShortsMakerError("AI 성우 생성 실패: " + " / ".join(errors))
-
-
-def _hybrid_voice_filter() -> str:
-    # 주 음성은 또렷하게, 보조 남성 레이어는 18%만 섞어 저음의 밀도만 보강합니다.
-    return (
-        "[0:a]aresample=48000,highpass=f=80,lowpass=f=14000,"
-        "equalizer=f=180:t=q:w=1:g=-1.5,equalizer=f=1200:t=q:w=1:g=1.2,"
-        "equalizer=f=3400:t=q:w=1:g=3.0,equalizer=f=7000:t=q:w=1:g=1.0,"
-        "volume=1.0[p];"
-        "[1:a]aresample=48000,adelay=18|18,highpass=f=70,lowpass=f=5200,"
-        "equalizer=f=150:t=q:w=1:g=2.0,volume=0.18[s];"
-        "[p][s]amix=inputs=2:duration=longest:normalize=0,"
-        "deesser=i=0.16:m=0.42:f=0.5,"
-        "acompressor=threshold=-20dB:ratio=2.8:attack=8:release=140:makeup=2.2,"
-        "alimiter=limit=0.94:attack=5:release=60,"
-        "loudnorm=I=-15:TP=-1:LRA=6[out]"
-    )
-
-
-def synthesize_hybrid_tts(text: str, workdir: Path, output_path: Path) -> str:
-    primary = workdir / "hybrid_primary.mp3"
-    secondary = workdir / "hybrid_secondary.mp3"
-    used_primary = synthesize_edge_tts(
-        text, "ko-KR-YuJinNeural", "+8%", primary, pitch="-12Hz", volume="+0%"
-    )
-    try:
-        used_secondary = synthesize_edge_tts(
-            text, "ko-KR-HyunsuNeural", "+8%", secondary, pitch="-6Hz", volume="-4%"
-        )
-        _run(
-            [
-                "ffmpeg", "-y", "-i", str(primary), "-i", str(secondary),
-                "-filter_complex", _hybrid_voice_filter(),
-                "-map", "[out]", "-c:a", "libmp3lame", "-b:a", "192k", str(output_path),
-            ],
-            "윤영×남성 하이브리드 음성 합성",
-        )
-        return f"윤영×남성 하이브리드({used_primary} 82% + {used_secondary} 18%)"
-    except Exception:
-        # 두 번째 음성이 일시적으로 막혀도 영상 제작 전체가 중단되지 않도록 단일 음성으로 대체합니다.
-        _run(
-            [
-                "ffmpeg", "-y", "-i", str(primary),
-                "-af", (
-                    "highpass=f=80,lowpass=f=14000,"
-                    "equalizer=f=180:t=q:w=1:g=1.0,equalizer=f=3400:t=q:w=1:g=3.0,"
-                    "acompressor=threshold=-20dB:ratio=2.7:attack=8:release=140:makeup=2.2,"
-                    "loudnorm=I=-15:TP=-1:LRA=6"
-                ),
-                "-c:a", "libmp3lame", "-b:a", "192k", str(output_path),
-            ],
-            "하이브리드 음성 대체 보정",
-        )
-        return f"윤영 시그니처 보정({used_primary})"
-
-
-def synthesize_adam_trendy_tts(text: str, workdir: Path, output_path: Path) -> str:
-    """요즘 쇼츠에서 많이 쓰는 밝고 속도감 있는 남성형 프리셋."""
-    raw = workdir / "adam_trendy_raw.mp3"
-    used = synthesize_edge_tts(
-        text, "ko-KR-HyunsuMultilingualNeural", "+17%", raw, pitch="+8Hz", volume="+3%"
-    )
-    _run(
-        [
-            "ffmpeg", "-y", "-i", str(raw),
-            "-af", (
-                "aresample=48000,highpass=f=90,lowpass=f=14900,"
-                "equalizer=f=210:t=q:w=1:g=-2.0,"
-                "equalizer=f=1650:t=q:w=1:g=1.6,"
-                "equalizer=f=3600:t=q:w=1:g=3.5,"
-                "equalizer=f=7600:t=q:w=1:g=1.4,"
-                "deesser=i=0.14:m=0.38:f=0.5,"
-                "acompressor=threshold=-21dB:ratio=2.8:attack=6:release=100:makeup=2.5,"
-                "alimiter=limit=0.93:attack=4:release=45,"
-                "loudnorm=I=-15:TP=-1:LRA=5"
-            ),
-            "-c:a", "libmp3lame", "-b:a", "192k", str(output_path),
-        ],
-        "에덤이 스타일 음성 보정",
-    )
-    return f"에덤이 스타일({used})"
-
-
-def synthesize_yoonyoung_signature_tts(text: str, workdir: Path, output_path: Path) -> str:
-    """윤영 참고 음성의 낮고 안정적인 중심 톤만 반영한 단일 음성 프리셋.
-
-    두 번째 화자, 지연 레이어, 에코, 리버브를 전혀 사용하지 않는다.
-    """
-    raw = workdir / "yoonyoung_signature_raw.mp3"
-    used = synthesize_edge_tts(
-        text, "ko-KR-YuJinNeural", "+10%", raw, pitch="-8Hz", volume="+0%"
-    )
-    _run(
-        [
-            "ffmpeg", "-y", "-i", str(raw),
-            "-af", (
-                "aresample=48000,highpass=f=85,lowpass=f=14200,"
-                "equalizer=f=180:t=q:w=1:g=-1.8,"
-                "equalizer=f=1050:t=q:w=1:g=1.4,"
-                "equalizer=f=3150:t=q:w=1:g=2.8,"
-                "equalizer=f=6500:t=q:w=1:g=0.8,"
-                "deesser=i=0.15:m=0.38:f=0.5,"
-                "acompressor=threshold=-21dB:ratio=2.6:attack=8:release=135:makeup=2.2,"
-                "alimiter=limit=0.94:attack=5:release=55,"
-                "loudnorm=I=-15:TP=-1:LRA=6"
-            ),
-            "-c:a", "libmp3lame", "-b:a", "192k", str(output_path),
-        ],
-        "윤영 단독 시그니처 음성 보정",
-    )
-    return f"윤영 단독 시그니처({used})"
-
-
-def synthesize_female_reference_tts(text: str, workdir: Path, output_path: Path) -> str:
-    """업로드된 여성 참고 음성의 밝기·피치·속도 특성을 반영한 단일 여성 음성.
-
-    남성 보조 음성, 딜레이, 에코, 코러스, 리버브를 사용하지 않는다.
-    """
-    raw = workdir / "female_reference_raw.mp3"
-    used = synthesize_edge_tts(
-        text, "ko-KR-SeoHyeonNeural", "+13%", raw, pitch="+16Hz", volume="+0%"
-    )
-    _run(
-        [
-            "ffmpeg", "-y", "-i", str(raw),
-            "-af", (
-                "aresample=48000,highpass=f=105,lowpass=f=14800,"
-                "equalizer=f=230:t=q:w=1:g=-2.6,"
-                "equalizer=f=1550:t=q:w=1:g=1.5,"
-                "equalizer=f=3350:t=q:w=1:g=3.1,"
-                "equalizer=f=6900:t=q:w=1:g=1.2,"
-                "deesser=i=0.14:m=0.36:f=0.5,"
-                "acompressor=threshold=-22dB:ratio=2.5:attack=6:release=115:makeup=2.3,"
-                "alimiter=limit=0.93:attack=4:release=50,"
-                "loudnorm=I=-15:TP=-1:LRA=5"
-            ),
-            "-c:a", "libmp3lame", "-b:a", "192k", str(output_path),
-        ],
-        "여성 참고음성 시그니처 보정",
-    )
-    return f"여성 참고음성 시그니처({used} · 단일 여성 음성)"
-
-def synthesize_female_reference_soft_tts(text: str, workdir: Path, output_path: Path) -> str:
-    """여성 참고 음성의 부드러운 버전. 단일 여성 음성만 사용한다."""
-    raw = workdir / "female_reference_soft_raw.mp3"
-    used = synthesize_edge_tts(
-        text, "ko-KR-YuJinNeural", "+10%", raw, pitch="+11Hz", volume="+0%"
-    )
-    _run(
-        [
-            "ffmpeg", "-y", "-i", str(raw),
-            "-af", (
-                "aresample=48000,highpass=f=95,lowpass=f=14600,"
-                "equalizer=f=240:t=q:w=1:g=-2.2,"
-                "equalizer=f=1450:t=q:w=1:g=1.3,"
-                "equalizer=f=3100:t=q:w=1:g=2.5,"
-                "equalizer=f=6400:t=q:w=1:g=0.9,"
-                "deesser=i=0.13:m=0.34:f=0.5,"
-                "acompressor=threshold=-22dB:ratio=2.4:attack=7:release=125:makeup=2.1,"
-                "alimiter=limit=0.93:attack=4:release=50,"
-                "loudnorm=I=-15:TP=-1:LRA=6"
-            ),
-            "-c:a", "libmp3lame", "-b:a", "192k", str(output_path),
-        ],
-        "여성 참고음성 B 보정",
-    )
-    return f"여성 참고음성 B({used} · 단일 여성 음성)"
 
 
 def ffprobe_duration(path: Path) -> float:
@@ -1332,313 +1020,6 @@ def search_pexels_image(query: str, api_key: str) -> str:
     except Exception:
         return ""
     return ""
-
-
-COMMONS_API = "https://commons.wikimedia.org/w/api.php"
-WIKIDATA_API = "https://www.wikidata.org/w/api.php"
-
-
-def _plain_meta(value: Any) -> str:
-    if isinstance(value, dict):
-        value = value.get("value") or value.get("source") or ""
-    clean = BeautifulSoup(str(value or ""), "html.parser").get_text(" ", strip=True)
-    return re.sub(r"\s+", " ", clean).strip()
-
-
-def _license_allowed(short_name: str, usage_terms: str, allow_share_alike: bool) -> bool:
-    label = f"{short_name} {usage_terms}".upper().replace("–", "-")
-    if any(blocked in label for blocked in ("NONCOMMERCIAL", "CC BY-NC", "-NC", "NO DERIV", "-ND")):
-        return False
-    if any(token in label for token in ("PUBLIC DOMAIN", "CC0", "PDM", "KOGL TYPE 1", "OPEN GOVERNMENT LICENSE TYPE 1")):
-        return True
-    if "CC BY-SA" in label:
-        return bool(allow_share_alike)
-    return "CC BY" in label
-
-
-def _visual_from_page(page: dict[str, Any], allow_share_alike: bool) -> LicensedVisual | None:
-    info_list = page.get("imageinfo") or []
-    if not info_list:
-        return None
-    info = info_list[0]
-    meta = info.get("extmetadata") or {}
-    license_short = _plain_meta(meta.get("LicenseShortName")) or _plain_meta(meta.get("UsageTerms"))
-    usage_terms = _plain_meta(meta.get("UsageTerms"))
-    review_text = " ".join([
-        _plain_meta(meta.get("Restrictions")),
-        _plain_meta(meta.get("Categories")),
-        _plain_meta(meta.get("Copyrighted")),
-    ]).lower()
-    if any(flag in review_text for flag in ("license review needed", "no permission", "copyright violation", "non-free")):
-        return None
-    if not _license_allowed(license_short, usage_terms, allow_share_alike):
-        return None
-    image_url = str(info.get("thumburl") or info.get("url") or "")
-    if not image_url:
-        return None
-    title = str(page.get("title") or "").replace("File:", "").strip()
-    author = _plain_meta(meta.get("Artist")) or _plain_meta(meta.get("Credit")) or "저작자 정보 확인 필요"
-    credit = _plain_meta(meta.get("Credit"))
-    license_url = _plain_meta(meta.get("LicenseUrl"))
-    page_url = str(info.get("descriptionurl") or "")
-    return LicensedVisual(
-        title=title,
-        image_url=image_url,
-        thumb_url=image_url,
-        page_url=page_url,
-        author=author,
-        license_short=license_short or usage_terms,
-        license_url=license_url,
-        credit=credit,
-    )
-
-
-def _commons_file_info(filename: str, allow_share_alike: bool = False) -> LicensedVisual | None:
-    try:
-        response = requests.get(
-            COMMONS_API,
-            params={
-                "action": "query", "format": "json", "formatversion": 2,
-                "titles": f"File:{filename}", "prop": "imageinfo",
-                "iiprop": "url|extmetadata", "iiurlwidth": 1400,
-                "origin": "*",
-            },
-            headers={"User-Agent": USER_AGENT}, timeout=6,
-        )
-        response.raise_for_status()
-        pages = response.json().get("query", {}).get("pages", [])
-        return _visual_from_page(pages[0], allow_share_alike) if pages else None
-    except Exception:
-        return None
-
-
-def _wikidata_subject(subject: str) -> tuple[list[str], list[LicensedVisual]]:
-    labels: list[str] = [subject]
-    visuals: list[LicensedVisual] = []
-    if not subject:
-        return labels, visuals
-    try:
-        search = requests.get(
-            WIKIDATA_API,
-            params={
-                "action": "wbsearchentities", "search": subject, "language": "ko",
-                "uselang": "ko", "type": "item", "limit": 3, "format": "json", "origin": "*",
-            },
-            headers={"User-Agent": USER_AGENT}, timeout=6,
-        )
-        search.raise_for_status()
-        results = search.json().get("search") or []
-        if not results:
-            return labels, visuals
-        qid = results[0].get("id")
-        if results[0].get("label"):
-            labels.append(str(results[0]["label"]))
-        if results[0].get("description"):
-            labels.append(str(results[0]["description"]))
-        entity = requests.get(
-            WIKIDATA_API,
-            params={
-                "action": "wbgetentities", "ids": qid, "props": "labels|aliases|claims",
-                "languages": "ko|en", "format": "json", "origin": "*",
-            },
-            headers={"User-Agent": USER_AGENT}, timeout=6,
-        )
-        entity.raise_for_status()
-        data = (entity.json().get("entities") or {}).get(qid) or {}
-        for lang in ("ko", "en"):
-            label = ((data.get("labels") or {}).get(lang) or {}).get("value")
-            if label:
-                labels.append(str(label))
-            for alias in (data.get("aliases") or {}).get(lang) or []:
-                if alias.get("value"):
-                    labels.append(str(alias["value"]))
-        claims = (data.get("claims") or {}).get("P18") or []
-        for claim in claims[:3]:
-            try:
-                filename = claim["mainsnak"]["datavalue"]["value"]
-            except Exception:
-                continue
-            visual = _commons_file_info(str(filename), allow_share_alike=True)
-            if visual:
-                visuals.append(visual)
-    except Exception:
-        pass
-    return _unique(labels), visuals
-
-
-def search_commons_images(query: str, limit: int = 8, allow_share_alike: bool = False) -> list[LicensedVisual]:
-    if not query:
-        return []
-    try:
-        response = requests.get(
-            COMMONS_API,
-            params={
-                "action": "query", "format": "json", "formatversion": 2,
-                "generator": "search", "gsrsearch": query, "gsrnamespace": 6,
-                "gsrlimit": max(3, min(limit, 20)), "prop": "imageinfo",
-                "iiprop": "url|extmetadata", "iiurlwidth": 1400, "origin": "*",
-            },
-            headers={"User-Agent": USER_AGENT}, timeout=6,
-        )
-        response.raise_for_status()
-        pages = response.json().get("query", {}).get("pages", [])
-        results: list[LicensedVisual] = []
-        for page in pages:
-            title = str(page.get("title") or "").lower()
-            if not re.search(r"\.(?:jpe?g|png|webp|tiff?)$", title):
-                continue
-            visual = _visual_from_page(page, allow_share_alike)
-            if visual:
-                results.append(visual)
-        dedup: list[LicensedVisual] = []
-        seen: set[str] = set()
-        for visual in results:
-            if visual.image_url in seen:
-                continue
-            seen.add(visual.image_url)
-            dedup.append(visual)
-        return dedup[:limit]
-    except Exception:
-        return []
-
-
-def _person_subject_candidates(title: str, body: str = "") -> list[str]:
-    """기사 제목에서 실제 인물명 후보를 빠르고 보수적으로 추출한다."""
-    clean = _clean_article_title(title)
-    clean = re.sub(r"^\s*\[[^\]]{1,30}\]\s*", "", clean)
-    clean = re.sub(r"[\r\n]+", " ", clean).strip()
-    generic = {
-        "배우", "가수", "아이돌", "방송인", "연예인", "모델", "개그맨", "코미디언",
-        "사진", "근황", "화제", "공개", "논란", "뉴스", "연예", "단독", "공식", "종합",
-        "아들", "딸", "남편", "아내", "부친", "모친", "팬들", "누리꾼", "기자",
-    }
-    candidates: list[str] = []
-
-    first_clause = re.split(r"\s*(?:,|…|\.{2,}|｜|\||:|=)\s*", clean, maxsplit=1)[0]
-    first_token = _strip_korean_josa(first_clause.split()[0] if first_clause.split() else "")
-    if re.fullmatch(r"[가-힣]{2,4}", first_token) and first_token not in generic:
-        return [first_token]
-
-    # '김희철은 가수', '배우 이탁수'처럼 직업과 직접 결합된 이름만 보강한다.
-    search_text = f"{clean[:160]} {(body or '')[:500]}"
-    for pattern in (
-        r"(?<![가-힣])([가-힣]{2,4})(?:은|는|이|가)?\s+(?:배우|가수|아이돌|방송인|모델|개그맨|코미디언)",
-        r"(?:배우|가수|아이돌|방송인|모델|개그맨|코미디언)\s+([가-힣]{2,4})(?![가-힣])",
-        r'["“‘]([가-힣]{2,4})["”’]',
-    ):
-        for name in re.findall(pattern, search_text):
-            name = _strip_korean_josa(name)
-            if name not in generic and re.fullmatch(r"[가-힣]{2,4}", name):
-                candidates.append(name)
-
-    if not candidates:
-        fallback = _title_subject(clean, _top_keywords(body or "", clean, 8))
-        if fallback and fallback not in generic:
-            candidates.append(fallback)
-    return _unique(candidates)[:3]
-
-
-def _recognized_open_license(value: str, allow_share_alike: bool = False) -> tuple[bool, str, str]:
-    raw = html_lib.unescape(str(value or "")).strip()
-    label = raw.upper().replace("–", "-")
-    url = raw if raw.startswith("http") else ""
-    if any(token in label for token in ("CC0", "PUBLIC DOMAIN", "PDM")) or "creativecommons.org/publicdomain" in raw.lower():
-        return True, "CC0/Public Domain", url
-    if "creativecommons.org/licenses/by-sa" in raw.lower() or "CC BY-SA" in label:
-        return bool(allow_share_alike), "CC BY-SA", url
-    if "creativecommons.org/licenses/by" in raw.lower() or "CC BY" in label:
-        return True, "CC BY", url
-    return False, "", url
-
-
-def find_explicitly_licensed_article_visuals(
-    article: ArticleData,
-    allow_share_alike: bool = False,
-    limit: int = 6,
-) -> list[LicensedVisual]:
-    """기사 페이지가 공개 라이선스를 명시한 경우에만 기사 이미지를 후보로 사용한다.
-
-    일반 언론사·네이버 기사 사진은 라이선스 표시가 없으므로 자동 사용되지 않는다.
-    """
-    allowed_label = ""
-    allowed_url = ""
-    for value in article.license_urls:
-        allowed, label, url = _recognized_open_license(value, allow_share_alike)
-        if allowed:
-            allowed_label = label
-            allowed_url = url or str(value)
-            break
-    if not allowed_label:
-        return []
-
-    author = article.page_author or article.publisher or "기사 페이지 표기 저작자"
-    visuals: list[LicensedVisual] = []
-    for idx, image_url in enumerate(article.images[:limit], 1):
-        visuals.append(
-            LicensedVisual(
-                title=f"{_short_caption(article.title, 60)} · 기사 이미지 {idx}",
-                image_url=image_url,
-                thumb_url=image_url,
-                page_url=article.url,
-                author=author,
-                license_short=allowed_label,
-                license_url=allowed_url,
-                credit=f"기사 페이지에 명시된 공개 라이선스 · {author}",
-                source="기사 페이지 공개 라이선스",
-            )
-        )
-    return visuals
-
-
-def find_rights_cleared_visuals(
-    article: ArticleData,
-    plan: dict[str, Any],
-    allow_share_alike: bool = False,
-    limit: int = 10,
-) -> list[LicensedVisual]:
-    """기사 주인공의 실제 사진 중 공개 라이선스가 확인되는 자료만 찾는다."""
-    results: list[LicensedVisual] = []
-
-    # 기사 자체에 CC/공개 라이선스가 명확히 표시된 매우 드문 경우만 허용
-    results.extend(find_explicitly_licensed_article_visuals(article, allow_share_alike, limit=limit))
-    if results:
-        return results[:limit]
-
-    title = _clean_article_title(article.title)
-    keywords = _top_keywords(article.text or "", title, 10)
-    subjects = _person_subject_candidates(title, article.text)
-    if not subjects:
-        subjects = [_title_subject(title, keywords)]
-
-    for subject in subjects[:2]:
-        labels, wikidata_visuals = _wikidata_subject(subject)
-        for visual in wikidata_visuals:
-            if _license_allowed(visual.license_short, visual.license_short, allow_share_alike):
-                results.append(visual)
-        if results:
-            break
-
-        queries = _unique([
-            subject,
-            *labels[:2],
-            f"{subject} actor",
-        ])
-        for query in queries[:2]:
-            results.extend(search_commons_images(query, limit=limit, allow_share_alike=allow_share_alike))
-            if results:
-                break
-        if results:
-            break
-
-    dedup: list[LicensedVisual] = []
-    seen: set[str] = set()
-    for item in results:
-        key = item.page_url or item.image_url
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append(item)
-    return dedup[:limit]
 
 
 
@@ -1726,23 +1107,6 @@ def _prepare_background(
     selected_mode = mode
     if mode == "auto":
         selected_mode = "blur" if mismatch > 1.48 else "cover"
-
-    if template == "entertainment_bright":
-        # 연예 쇼츠용: 실제 인물 사진을 화면 중심에 크게 보여주고 밝은 핑크·옐로 톤으로 마감한다.
-        blurred = _fit_cover(original, size, 0.42).filter(ImageFilter.GaussianBlur(radius=max(20, width // 28)))
-        blurred = ImageEnhance.Brightness(blurred).enhance(0.88)
-        blurred = ImageEnhance.Color(blurred).enhance(1.28).convert("RGBA")
-        tint = Image.new("RGBA", size, (255, 105, 180, 34 if index % 2 == 0 else 22))
-        blurred = Image.alpha_composite(blurred, tint)
-        max_w = int(width * 0.92)
-        max_h = int(height * 0.69)
-        foreground = _fit_contain(original, (max_w, max_h))
-        foreground = ImageEnhance.Color(foreground.convert("RGB")).enhance(1.16)
-        foreground = ImageEnhance.Contrast(foreground).enhance(1.05)
-        x = (width - foreground.width) // 2
-        y = int(height * 0.145) + max(0, (max_h - foreground.height) // 2)
-        _paste_rounded(blurred, foreground, (x, y), radius=max(22, width // 24))
-        return blurred
 
     if selected_mode == "cover":
         result = _fit_cover(original, size, 0.42).convert("RGBA")
@@ -1966,52 +1330,6 @@ def _draw_editorial_art(canvas: Image.Image, text: str, index: int, accent: tupl
         draw.ellipse((cx-int(34*scale),cy-int(34*scale),cx+int(34*scale),cy+int(34*scale)), fill=(255,255,255,235))
     return base
 
-def _draw_speed_lines(draw: ImageDraw.ImageDraw, width: int, height: int, color=(255,255,255,150), step: int = 42) -> None:
-    cx, cy = width // 2, int(height * 0.22)
-    for x in range(0, width, step):
-        draw.line((x, 0, int(x*0.78 + cx*0.22), cy), fill=color, width=2)
-    for x in range(0, width, step):
-        draw.line((x, int(height*0.36), int(x*0.78 + cx*0.22), cy), fill=color, width=2)
-
-
-def _pick_sticker_text(title: str) -> str:
-    cleaned = re.sub(r"[^가-힣A-Za-z0-9 ]+", " ", title or "").strip()
-    if not cleaned:
-        return "핫이슈"
-    words = [w for w in cleaned.split() if len(w) >= 2]
-    if not words:
-        return cleaned[:4] or "핫이슈"
-    best = max(words, key=len)
-    return best[:6]
-
-
-def _draw_sticker_text(base: Image.Image, text: str, style: str, accent: tuple[int,int,int]) -> None:
-    if not text or style == "none":
-        return
-    draw = ImageDraw.Draw(base, "RGBA")
-    width, height = base.size
-    scale = width / 720
-    font_path = find_font(True)
-    font = ImageFont.truetype(font_path, max(56, int(92 * scale)))
-    y = int(height * 0.16)
-    x = width // 2
-    txt = text.strip()[:10]
-    if style == "shocking_red":
-        for off in range(10, 0, -2):
-            draw.text((x, y), txt, anchor="ma", font=font, fill=(255,120,60,16+off*10), stroke_width=max(2,int(2*scale)), stroke_fill=(255,90,20,20))
-        draw.text((x, y), txt, anchor="ma", font=font, fill=(255,40,40,255), stroke_width=max(8,int(8*scale)), stroke_fill=(255,255,255,255))
-    elif style == "tension_black":
-        draw.rounded_rectangle((int(width*0.31), y-int(16*scale), int(width*0.69), y+int(80*scale)), radius=int(20*scale), fill=(255,255,255,70))
-        draw.text((x+int(4*scale), y+int(4*scale)), txt, anchor="ma", font=font, fill=(0,0,0,110), stroke_width=max(3,int(3*scale)), stroke_fill=(255,255,255,70))
-        draw.text((x, y), txt, anchor="ma", font=font, fill=(240,240,240,255), stroke_width=max(6,int(6*scale)), stroke_fill=(20,20,20,255))
-    elif style == "hit_burst":
-        _draw_speed_lines(draw, width, height, color=(255,255,255,165), step=max(28,int(40*scale)))
-        draw.text((x+int(6*scale), y+int(6*scale)), txt, anchor="ma", font=font, fill=(0,0,0,100), stroke_width=max(3,int(3*scale)), stroke_fill=(0,0,0,80))
-        draw.text((x, y), txt, anchor="ma", font=font, fill=(255,40,40,255), stroke_width=max(10,int(10*scale)), stroke_fill=(255,255,255,255))
-    else:
-        draw.text((x, y), txt, anchor="ma", font=font, fill=(255,255,255,255), stroke_width=max(6,int(6*scale)), stroke_fill=(0,0,0,255))
-
-
 def make_scene_card(
     image_path: Path | None,
     output_path: Path,
@@ -2029,8 +1347,6 @@ def make_scene_card(
     show_hook: bool = True,
     show_badge: bool = False,
     size: tuple[int, int] = (720, 1280),
-    sticker_style: str = "none",
-    sticker_text: str = "",
 ) -> None:
     width, height = size
     scale = width / 720
@@ -2038,26 +1354,12 @@ def make_scene_card(
     canvas = _prepare_background(image_path, size, index, background_mode, template)
     if image_path is None:
         canvas = _draw_editorial_art(canvas, f"{caption} {title} {hook}", index, accent)
-    if template == "entertainment_bright":
-        canvas = _overlay_vertical_gradient(canvas, top_alpha=105, bottom_alpha=190, middle_alpha=0)
-        deco = ImageDraw.Draw(canvas, "RGBA")
-        for n in range(12):
-            x = int(width * (0.06 + ((n * 0.173 + index * 0.091) % 0.88)))
-            y = int(height * (0.08 + ((n * 0.113 + index * 0.057) % 0.67)))
-            r = max(3, int((4 + n % 3 * 3) * scale))
-            deco.ellipse((x-r, y-r, x+r, y+r), fill=(255, 244, 120, 92))
-        deco.rounded_rectangle(
-            (margin - int(10 * scale), int(72 * scale), width - margin + int(10 * scale), int(232 * scale)),
-            radius=int(28 * scale), fill=(255, 255, 255, 55), outline=(255, 188, 220, 120),
-            width=max(2, int(3 * scale)),
-        )
-    else:
-        canvas = _overlay_vertical_gradient(
-            canvas,
-            top_alpha=170 if template != "card" else 190,
-            bottom_alpha=230 if template == "highlight" else 215,
-            middle_alpha=16,
-        )
+    canvas = _overlay_vertical_gradient(
+        canvas,
+        top_alpha=170 if template != "card" else 190,
+        bottom_alpha=230 if template == "highlight" else 215,
+        middle_alpha=16,
+    )
     draw = ImageDraw.Draw(canvas)
 
     font_bold = find_font(True)
@@ -2161,7 +1463,7 @@ def make_scene_card(
         draw,
         caption,
         font_bold,
-        int((56 if template in {"highlight", "entertainment_bright"} else 50) * scale),
+        int((54 if template == "highlight" else 50) * scale),
         int(38 * scale),
         caption_width,
         2,
@@ -2169,12 +1471,10 @@ def make_scene_card(
     line_h = int(_measure(draw, "가나다", caption_font, 3)[1] * 1.28)
     total_h = line_h * len(caption_lines)
 
-    if template in {"highlight", "entertainment_bright"}:
+    if template == "highlight":
         caption_y = min(caption_y, height - int(116 * scale) - total_h)
-        if subtitle_style == "box" or template == "entertainment_bright":
+        if subtitle_style == "box":
             pad_y = int(24 * scale)
-            fill_color = (34, 18, 45, 202) if template == "entertainment_bright" else (8, 10, 17, 196)
-            outline_color = (*accent, 190) if template == "entertainment_bright" else None
             draw.rounded_rectangle(
                 (
                     margin - int(12 * scale),
@@ -2183,9 +1483,7 @@ def make_scene_card(
                     caption_y + total_h + pad_y,
                 ),
                 radius=int(26 * scale),
-                fill=fill_color,
-                outline=outline_color,
-                width=max(2, int(3 * scale)) if outline_color else 1,
+                fill=(8, 10, 17, 196),
             )
     else:
         caption_y = min(caption_y, height - int(118 * scale) - total_h)
@@ -2231,130 +1529,6 @@ def make_scene_card(
         stroke_fill=(0, 0, 0, 145),
     )
     canvas.convert("RGB").save(output_path, quality=96)
-
-
-def _speech_units(text: str) -> int:
-    return len(re.findall(r"[0-9A-Za-z가-힣]", text or ""))
-
-
-def fit_plan_to_target_duration(
-    plan: dict[str, Any], article: ArticleData, target_duration: int
-) -> dict[str, Any]:
-    """선택한 30/45/60초에 맞춰 대본 분량과 장면 수를 자동 보강합니다."""
-    fitted = dict(plan)
-    title = _clean_article_title(article.title)
-    body = re.sub(r"\s+", " ", article.text or "").strip()
-    keywords = _top_keywords(body, title, 10)
-    numbers = _extract_numbers(body, 5)
-    subject = _title_subject(title, keywords)
-    event = _detect_title_event(title, body, "연예")
-    sentences = [
-        re.sub(r"\s+", " ", str(scene.get("narration") or "")).strip()
-        for scene in (plan.get("scenes") or [])
-        if str(scene.get("narration") or "").strip()
-    ]
-    if not sentences:
-        sentences = [str(plan.get("narration") or title).strip()]
-
-    target_units = int(max(30, target_duration) * 6.2)
-    fillers = [
-        f"이 소식에서 먼저 볼 부분은 {subject}와 관련해 실제로 확인된 변화가 무엇인지입니다.",
-        f"특히 {event}라는 표현만 보면 단순한 근황처럼 보이지만, 기사 속 맥락을 함께 봐야 이해가 됩니다.",
-        f"관심이 커진 이유는 {subject}의 이전 모습과 이번에 전해진 내용 사이에 차이가 있기 때문입니다.",
-        f"두 번째 포인트는 온라인 반응보다 당사자나 관계자가 직접 밝힌 내용이 어디까지인지 구분하는 것입니다.",
-        f"기사에서 반복해서 등장하는 핵심어는 {', '.join(keywords[:4]) if keywords else '공식 발표와 후속 내용'}입니다.",
-        f"이 부분은 단순한 화제성보다 앞으로 실제 활동이나 일정으로 이어지는지가 더 중요합니다.",
-        f"또 하나 확인할 점은 사진과 짧은 문구만으로 전체 상황을 단정하면 맥락을 놓칠 수 있다는 것입니다.",
-        f"현재까지는 확인된 사실과 팬들의 해석을 나눠서 보는 편이 가장 정확합니다.",
-        f"결국 이번 소식의 핵심은 {subject}에게 어떤 변화가 생겼고, 그 변화가 왜 지금 주목받는지에 있습니다.",
-        "후속 공식 발표나 새로운 일정이 나오면 지금의 해석도 달라질 수 있습니다.",
-        "여러분은 이번 변화가 기대되는 소식이라고 보시나요, 아니면 조금 더 지켜봐야 한다고 보시나요?",
-    ]
-    if numbers:
-        fillers.insert(3, f"기사에 나온 수치 가운데 {'·'.join(numbers[:3])}도 함께 확인할 필요가 있습니다.")
-
-    seen = {re.sub(r"\W+", "", s) for s in sentences}
-    for sentence in fillers:
-        key = re.sub(r"\W+", "", sentence)
-        if _speech_units(" ".join(sentences)) >= target_units:
-            break
-        if key not in seen:
-            sentences.insert(max(1, len(sentences) - 1), sentence)
-            seen.add(key)
-
-    # 여전히 짧으면 핵심 포인트를 자연스럽게 반복 확장하되 같은 문장은 사용하지 않습니다.
-    counter = 1
-    while _speech_units(" ".join(sentences)) < target_units and counter <= 8:
-        key_term = keywords[(counter - 1) % len(keywords)] if keywords else subject
-        extra = f"{counter}번째로 볼 지점은 {key_term}가 이번 소식의 전체 흐름에서 어떤 의미를 갖는지입니다."
-        sentences.insert(max(1, len(sentences) - 1), extra)
-        counter += 1
-
-    max_units = int(target_units * 1.18)
-    while len(sentences) > 4 and _speech_units(" ".join(sentences)) > max_units:
-        sentences.pop(-2)
-
-    desired_scenes = 6 if target_duration <= 30 else 9 if target_duration <= 45 else 11
-    # 문장이 너무 많거나 적으면 의미 단위로 장면 수에 맞춥니다.
-    if len(sentences) > desired_scenes:
-        groups: list[list[str]] = [[] for _ in range(desired_scenes)]
-        for idx, sentence in enumerate(sentences):
-            groups[min(desired_scenes - 1, int(idx * desired_scenes / len(sentences)))].append(sentence)
-        sentences = [" ".join(group) for group in groups if group]
-    elif len(sentences) < desired_scenes:
-        words = " ".join(sentences).split()
-        chunk = max(8, math.ceil(len(words) / desired_scenes))
-        sentences = [" ".join(words[i:i + chunk]) for i in range(0, len(words), chunk)]
-
-    scenes: list[dict[str, Any]] = []
-    for sentence in sentences[:12]:
-        scenes.append({
-            "caption": _short_caption(sentence, 28),
-            "emphasis": _pick_emphasis(sentence),
-            "narration": sentence,
-            "stock_keywords": " ".join(keywords[:3]),
-            "visual_note": f"{subject} 또는 기사 주제와 직접 관련된 권리확인 사진",
-        })
-    fitted["scenes"] = scenes
-    fitted["narration"] = " ".join(scene["narration"] for scene in scenes)
-    fitted["duration_target"] = int(target_duration)
-    return fitted
-
-
-def _atempo_chain(factor: float) -> str:
-    factor = max(0.25, min(4.0, factor))
-    parts: list[float] = []
-    while factor < 0.5:
-        parts.append(0.5)
-        factor /= 0.5
-    while factor > 2.0:
-        parts.append(2.0)
-        factor /= 2.0
-    parts.append(factor)
-    return ",".join(f"atempo={value:.6f}" for value in parts)
-
-
-def fit_audio_to_exact_duration(input_path: Path, target_duration: float, output_path: Path) -> tuple[float, str]:
-    original = ffprobe_duration(input_path)
-    ratio = original / max(target_duration, 0.1)
-    # 자연스러운 범위 안에서는 속도를 맞추고, 큰 차이는 과도한 변조 대신 무음 패딩/끝부분 절단을 사용합니다.
-    if 0.84 <= ratio <= 1.20:
-        filter_chain = f"{_atempo_chain(ratio)},apad=pad_dur={target_duration:.3f},atrim=0:{target_duration:.3f},loudnorm=I=-15:TP=-1:LRA=7"
-        note = f"속도 자동 보정 {ratio:.3f}배"
-    elif ratio < 0.84:
-        filter_chain = f"atempo=0.84,apad=pad_dur={target_duration:.3f},atrim=0:{target_duration:.3f},loudnorm=I=-15:TP=-1:LRA=7"
-        note = "최대 16% 느리게 보정 후 부족 구간은 BGM·화면 유지"
-    else:
-        filter_chain = f"atempo=1.20,apad=pad_dur={target_duration:.3f},atrim=0:{target_duration:.3f},loudnorm=I=-15:TP=-1:LRA=7"
-        note = "최대 20% 빠르게 보정 후 목표 길이에서 종료"
-    _run(
-        [
-            "ffmpeg", "-y", "-i", str(input_path), "-af", filter_chain,
-            "-c:a", "libmp3lame", "-b:a", "192k", str(output_path),
-        ],
-        "목표 길이 음성 맞춤",
-    )
-    return original, note
 
 
 def allocate_durations(scenes: list[dict[str, str]], total_duration: float) -> list[float]:
@@ -2438,54 +1612,6 @@ def process_user_voice(input_path: Path, preset: str, output_path: Path) -> None
     )
 
 
-
-SIGNATURE_VOICE_PROFILE = {
-    "label": "윤영 시그니처 · 내 목소리 톤 기반 AI",
-    "voice": "ko-KR-HyunsuNeural",
-    "rate": "+13%",
-    "profile": "yoonyoung_signature",
-    # 업로드된 음성에서 추출한 비식별 스타일 값만 반영: 낮고 안정적인 중심음, 약 123 BPM의 말하기 리듬,
-    # 중저역은 정리하고 3~7kHz 명료도를 높이는 방향. 원본 음성 파일은 앱/저장소에 포함하지 않는다.
-}
-
-
-def _signature_voice_filter(profile: str, use_rubberband: bool = True) -> str:
-    common = (
-        "highpass=f=85,lowpass=f=14000,afftdn=nf=-28,"
-        "deesser=i=0.18:m=0.45:f=0.5,"
-        "equalizer=f=180:t=q:w=1:g=-1.8,"
-        "equalizer=f=950:t=q:w=1:g=1.2,"
-        "equalizer=f=3300:t=q:w=1:g=3.2,"
-        "equalizer=f=6800:t=q:w=1:g=1.3,"
-    )
-    pitch = "rubberband=pitch=0.975:tempo=1.0," if use_rubberband else "asetrate=48000*0.975,aresample=48000,atempo=1.02564,"
-    finish = (
-        "acompressor=threshold=-20dB:ratio=2.8:attack=8:release=145:makeup=2.4,"
-        "alimiter=limit=0.94:attack=5:release=60,"
-        "loudnorm=I=-15:TP=-1:LRA=6"
-    )
-    return common + pitch + finish
-
-
-def process_ai_signature_voice(input_path: Path, profile: str, output_path: Path) -> None:
-    if not input_path.exists() or input_path.stat().st_size < 1000:
-        raise ShortsMakerError("AI 성우 원본 음성이 비어 있습니다.")
-    primary = [
-        "ffmpeg", "-y", "-i", str(input_path),
-        "-af", _signature_voice_filter(profile, use_rubberband=True),
-        "-c:a", "libmp3lame", "-b:a", "192k", str(output_path),
-    ]
-    result = subprocess.run(primary, capture_output=True, text=True, check=False)
-    if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
-        return
-    fallback = [
-        "ffmpeg", "-y", "-i", str(input_path),
-        "-af", _signature_voice_filter(profile, use_rubberband=False),
-        "-c:a", "libmp3lame", "-b:a", "192k", str(output_path),
-    ]
-    _run(fallback, "내 목소리 톤 기반 AI 보정")
-
-
 def _music_asset_path(track_label: str) -> Path | None:
     filename = MUSIC_TRACK_OPTIONS.get(track_label)
     if not filename:
@@ -2533,104 +1659,46 @@ def render_video(
     music_track: str = "자동 추천",
     music_volume: float = 0.11,
     custom_music: Path | None = None,
-    ai_voice_profile: str = "",
-    target_duration: int = 45,
-    visual_mode: str = "rights_cleared",
-    allow_share_alike: bool = False,
-    user_visuals: Sequence[Path] | None = None,
-    licensed_visuals_override: Sequence[LicensedVisual] | None = None,
-    sticker_style: str = "none",
-    sticker_text: str = "",
+    approved_visuals: list[Path] | None = None,
 ) -> dict[str, Path]:
     progress = progress or (lambda _: None)
     temp_root = Path(workdir or tempfile.mkdtemp(prefix="shortsmaker_"))
     temp_root.mkdir(parents=True, exist_ok=True)
-    target_duration = int(max(15, min(90, target_duration)))
 
-    plan = fit_plan_to_target_duration(plan, article, target_duration)
     scenes: list[dict[str, str]] = plan["scenes"]
     narration = plan["narration"]
-
-    raw_audio = temp_root / "narration_unfitted.mp3"
+    audio_path = temp_root / "narration.mp3"
     if narration_audio is not None:
         progress("업로드한 내 목소리를 깨끗하고 듣기 좋게 보정하고 있습니다.")
-        process_user_voice(narration_audio, voice_preset, raw_audio)
-        actual_voice = f"내 목소리 직접 녹음 보정 · {voice_preset}"
-        voice_mode = "내 목소리 직접 녹음"
-    elif ai_voice_profile == "yoonyoung_signature":
-        progress("윤영 단독 시그니처 음성을 생성하고 있습니다.")
-        actual_voice = synthesize_yoonyoung_signature_tts(narration, temp_root, raw_audio)
-        voice_mode = "윤영 단독 시그니처 AI"
-    elif ai_voice_profile == "yoonyoung_male_hybrid":
-        progress("선택한 경우에만 윤영 톤과 남성 저음 레이어를 82:18로 합성합니다.")
-        actual_voice = synthesize_hybrid_tts(narration, temp_root, raw_audio)
-        voice_mode = "윤영×남성 하이브리드 AI"
-    elif ai_voice_profile == "adam_trendy":
-        progress("에덤이 스타일의 트렌디 남성 AI 음성을 생성하고 있습니다.")
-        actual_voice = synthesize_adam_trendy_tts(narration, temp_root, raw_audio)
-        voice_mode = "에덤이 스타일 AI"
-    elif ai_voice_profile == "female_reference_signature":
-        progress("남성 레이어 없이 여성 참고음성 A를 생성하고 있습니다.")
-        actual_voice = synthesize_female_reference_tts(narration, temp_root, raw_audio)
-        voice_mode = "여성 참고음성 A · 단일 여성"
-    elif ai_voice_profile == "female_reference_soft":
-        progress("남성 레이어 없이 여성 참고음성 B를 생성하고 있습니다.")
-        actual_voice = synthesize_female_reference_soft_tts(narration, temp_root, raw_audio)
-        voice_mode = "여성 참고음성 B · 단일 여성"
+        process_user_voice(narration_audio, voice_preset, audio_path)
+        actual_voice = f"내 목소리 보정 · {voice_preset}"
+        voice_mode = "내 목소리"
     else:
-        progress("선택한 AI 성우 나레이션을 생성하고 있습니다.")
-        actual_voice = synthesize_edge_tts(narration, voice, rate, raw_audio)
+        progress("AI 성우 나레이션을 생성하고 있습니다.")
+        actual_voice = synthesize_edge_tts(narration, voice, rate, audio_path)
         voice_mode = "AI 성우"
 
-    audio_path = temp_root / "narration.mp3"
-    original_audio_duration, duration_note = fit_audio_to_exact_duration(raw_audio, float(target_duration), audio_path)
-    durations = allocate_durations(scenes, float(target_duration))
+    audio_duration = ffprobe_duration(audio_path)
+    durations = allocate_durations(scenes, max(audio_duration + 0.35, 3.0 * len(scenes)))
 
-    user_visuals = [Path(p) for p in (user_visuals or []) if Path(p).exists()]
-    licensed_visuals: list[LicensedVisual] = list(licensed_visuals_override or [])
-    if not licensed_visuals and visual_mode in {"rights_cleared", "uploaded_plus_rights"}:
-        progress("기사 주인공의 공개 라이선스 실제 사진을 찾고 있습니다.")
-        licensed_visuals = find_rights_cleared_visuals(
-            article, plan, allow_share_alike=allow_share_alike, limit=max(8, len(scenes) + 2)
-        )
-
-    progress("권리 확인 사진과 자체 그래픽으로 장면을 구성하고 있습니다.")
+    progress("저작권 안전 스톡 이미지와 자체 그래픽으로 장면을 구성하고 있습니다.")
     scene_clips: list[Path] = []
     used_visuals: list[str] = []
-    image_credits: list[str] = []
-    download_cache: dict[str, Path] = {}
-
     for idx, (scene, scene_duration) in enumerate(zip(scenes, durations)):
         image_path: Path | None = None
-        source_label = article.publisher or urllib.parse.urlparse(article.url).netloc
-
-        if user_visuals and visual_mode == "uploaded":
-            image_path = user_visuals[idx % len(user_visuals)]
-        elif user_visuals and visual_mode == "uploaded_plus_rights" and idx < len(user_visuals):
-            image_path = user_visuals[idx]
-            source_label = "사용자 권리확인 사진"
-            used_visuals.append(f"장면 {idx + 1}: 사용자가 업로드하고 사용 권한을 확인한 사진 · {image_path.name}")
-        elif licensed_visuals and visual_mode in {"rights_cleared", "uploaded_plus_rights"}:
-            visual = licensed_visuals[idx % len(licensed_visuals)]
-            cached = download_cache.get(visual.image_url)
-            if cached is None:
-                candidate = temp_root / f"commons_{len(download_cache):02}.jpg"
-                if _download_image(visual.image_url, candidate):
-                    cached = candidate
-                    download_cache[visual.image_url] = candidate
-            if cached is not None:
-                image_path = cached
-                source_label = f"{visual.source} · {visual.license_short}"
-                credit_line = (
-                    f"{visual.title} / {visual.author} / {visual.license_short} / "
-                    f"{visual.page_url or visual.image_url} / {visual.license_url or '라이선스 URL은 파일 페이지 확인'}"
-                )
-                if credit_line not in image_credits:
-                    image_credits.append(credit_line)
-                used_visuals.append(f"장면 {idx + 1}: {credit_line}")
-
+        safe_visuals = approved_visuals or []
+        if idx < len(safe_visuals) and safe_visuals[idx].exists():
+            image_path = safe_visuals[idx]
+            used_visuals.append(f"장면 {idx + 1}: 권리 검토 통과 사용자 자료 · {image_path.name}")
+        else:
+            pexels_url = search_pexels_image(scene.get("stock_keywords", ""), pexels_key)
+            if pexels_url:
+                candidate = temp_root / f"pexels_{idx:02}.jpg"
+                if _download_image(pexels_url, candidate):
+                    image_path = candidate
+                    used_visuals.append(f"장면 {idx + 1}: Pexels 스톡 이미지 · {scene.get('stock_keywords','')}")
         if image_path is None:
-            used_visuals.append(f"장면 {idx + 1}: 권리확인 사진을 찾지 못해 프로그램 자체 에디토리얼 그래픽 사용")
+            used_visuals.append(f"장면 {idx + 1}: 승인된 실제 자료 없음 · 자체 그래픽 fallback")
 
         card_path = temp_root / f"scene_{idx:02}.jpg"
         make_scene_card(
@@ -2641,7 +1709,7 @@ def render_video(
             title=plan["video_title"],
             hook=plan.get("hook") or plan["video_title"],
             category="",
-            source=source_label,
+            source=article.publisher or urllib.parse.urlparse(article.url).netloc,
             index=idx,
             template=template,
             subtitle_style=subtitle_style,
@@ -2650,8 +1718,6 @@ def render_video(
             show_hook=show_hook,
             show_badge=False,
             size=resolution,
-            sticker_style=sticker_style,
-            sticker_text=sticker_text,
         )
         clip_path = temp_root / f"clip_{idx:02}.mp4"
         _run(
@@ -2670,18 +1736,11 @@ def render_video(
         )
         scene_clips.append(clip_path)
 
-    progress("장면을 선택한 길이에 정확히 맞춰 합치고 있습니다.")
+    progress("장면을 하나의 세로 영상으로 합치고 있습니다.")
     concat_file = temp_root / "concat.txt"
     concat_file.write_text("\n".join(f"file '{clip.as_posix()}'" for clip in scene_clips), encoding="utf-8")
     silent_video = temp_root / "silent.mp4"
-    _run(
-        [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file),
-            "-t", f"{target_duration:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-pix_fmt", "yuv420p", str(silent_video),
-        ],
-        "장면 합치기",
-    )
+    _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(silent_video)], "장면 합치기")
 
     selected_music_label = "사용 안 함"
     prepared_music: Path | None = None
@@ -2701,7 +1760,7 @@ def render_video(
 
     final_video = temp_root / "final_short.mp4"
     if prepared_music is not None:
-        fade_out = max(0.0, target_duration - 1.2)
+        fade_out = max(0.0, audio_duration - 1.2)
         volume = min(max(float(music_volume), 0.0), 0.35)
         _run(
             [
@@ -2709,12 +1768,12 @@ def render_video(
                 "-stream_loop", "-1", "-i", str(prepared_music),
                 "-filter_complex",
                 (
-                    f"[2:a]volume={volume:.4f},atrim=0:{target_duration:.3f},"
+                    f"[2:a]volume={volume:.4f},atrim=0:{audio_duration:.3f},"
                     f"afade=t=in:st=0:d=0.7,afade=t=out:st={fade_out:.3f}:d=1.2[bg];"
-                    "[1:a][bg]amix=inputs=2:duration=longest:dropout_transition=2:normalize=0[aout]"
+                    "[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
                 ),
-                "-map", "0:v:0", "-map", "[aout]", "-t", f"{target_duration:.3f}",
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(final_video),
+                "-map", "0:v:0", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-shortest", "-movflags", "+faststart", str(final_video),
             ],
             "나레이션과 자동 배경음악 합성",
         )
@@ -2722,43 +1781,37 @@ def render_video(
         _run(
             [
                 "ffmpeg", "-y", "-i", str(silent_video), "-i", str(audio_path),
-                "-t", f"{target_duration:.3f}", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
-                "-movflags", "+faststart", str(final_video),
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest", "-movflags", "+faststart", str(final_video),
             ],
             "최종 영상 합성",
         )
 
-    final_duration = ffprobe_duration(final_video)
     srt_path = temp_root / "subtitles.srt"
     srt_path.write_text(make_srt(scenes, durations), encoding="utf-8-sig")
     script_path = temp_root / "vrew_script.txt"
     script_path.write_text(narration, encoding="utf-8-sig")
-    credits_text = "\n".join(f"- {line}" for line in image_credits) or "- 공개 라이선스 사진 미사용 또는 검색 결과 없음"
     metadata_path = temp_root / "youtube_metadata.txt"
     metadata_path.write_text(
         f"제목\n{plan['video_title']}\n\n설명\n{plan['description']}\n\n"
-        f"{' '.join(plan['hashtags'])}\n\n참고 기사\n{article.publisher}\n{article.url}\n\n사진 출처·라이선스\n{credits_text}\n",
+        f"{' '.join(plan['hashtags'])}\n\n참고 출처\n{article.publisher}\n{article.url}\n",
+        encoding="utf-8-sig",
+    )
+    naver_metadata_path = temp_root / "naver_clip_metadata.txt"
+    naver_tags = list(plan.get("hashtags") or [])[:5]
+    naver_metadata_path.write_text(
+        f"제목\n{plan['video_title']}\n\n설명\n{plan['description'][:300]}\n\n"
+        f"해시태그\n{' '.join(naver_tags)}\n\n참고 출처\n{article.publisher}\n{article.url}\n",
         encoding="utf-8-sig",
     )
     source_path = temp_root / "source.txt"
     source_path.write_text(
         f"기사 제목: {article.title}\n매체: {article.publisher}\nURL: {article.url}\n"
-        f"선택 길이: {target_duration}초\n실제 완성 길이: {final_duration:.3f}초\n"
-        f"원 음성 길이: {original_audio_duration:.3f}초\n길이 보정: {duration_note}\n"
         f"나레이션 방식: {voice_mode}\n사용 성우/프리셋: {actual_voice}\n배경음악: {selected_music_label}\n",
         encoding="utf-8-sig",
     )
     visual_path = temp_root / "visual_sources.txt"
     visual_path.write_text(
-        "일반 기사 사진 자동 다운로드: 사용 안 함\n"
-        "기사 페이지에 CC/공개 라이선스가 명시된 이미지: 조건 충족 시 사용 가능\n"
-        "동일 인물·주제의 권리확인 사진: Wikidata/Wikimedia Commons 라이선스 메타데이터 확인 후 사용\n"
-        + "\n".join(used_visuals) + "\n",
-        encoding="utf-8-sig",
-    )
-    image_credits_path = temp_root / "image_credits.txt"
-    image_credits_path.write_text(
-        "영상 설명란에 아래 내용을 그대로 넣어주세요.\n\n" + credits_text + "\n",
+        "기사 사진 사용: 없음\n방송 화면 사용: 없음\n" + "\n".join(used_visuals) + "\n",
         encoding="utf-8-sig",
     )
     license_path = temp_root / "music_license.txt"
@@ -2771,38 +1824,31 @@ def render_video(
     )
     report_path = temp_root / "copyright_check_report.txt"
     report_path.write_text(
-        "쇼츠메이커 CLOUD V3.6 저작권·길이 안전 점검\n\n"
-        f"[길이]\n선택: {target_duration}초\n완성: {final_duration:.3f}초\n"
-        f"음성 길이 보정: {duration_note}\n"
+        "쇼츠메이커 CLOUD V4.0 저작권 안전 점검\n\n"
         "[대본]\n기사 원문 직접 낭독: 사용 안 함\n사실 기반 재작성: 적용\n"
         f"원문과 최장 연속 유사 어절: {int(plan.get('originality_overlap_words') or 0)}어절\n"
-        "[영상]\n일반 언론사·네이버 기사 사진 자동 사용: 안 함\n"
-        "기사 페이지 명시 공개 라이선스 이미지: 확인된 경우에만 사용\n"
-        f"권리확인 사진 수: {len(image_credits)}개\n"
-        "허용 기본 라이선스: Public Domain, CC0, CC BY, KOGL Type 1\n"
-        f"CC BY-SA 포함 설정: {'예' if allow_share_alike else '아니오'}\n"
+        "[영상]\n기사 대표 사진: 사용 안 함\n방송 캡처/타 유튜브 영상: 사용 안 함\n"
+        "Pexels 또는 자체 생성 그래픽: 사용\n"
         f"[음성]\n나레이션: {voice_mode} / {actual_voice}\n"
-        "참고 음성 파일의 실제 화자 신원은 복제하지 않고 음높이·밝기·속도 특성만 프리셋에 반영\n"
         f"[음악]\n{selected_music_label}\n생성형 음악 공개 안내 권장: {music_disclosure}\n\n"
-        "주의: 라이선스 메타데이터와 초상권·퍼블리시티권은 별개일 수 있으므로 최종 게시 전 사진 파일 페이지를 확인하세요.\n",
+        "주의: 이 보고서는 위험을 줄이기 위한 제작 기록이며 법적 무침해를 보증하지 않습니다.\n",
         encoding="utf-8-sig",
     )
     disclosure_path = temp_root / "ai_disclosure.txt"
     disclosure_path.write_text(
         "YouTube 업로드 시 확인\n"
-        f"- 음성 모드: {voice_mode}\n"
-        "- 실제 인물의 발언을 흉내 내는 용도로 사용하지 않음\n"
+        f"- 내 목소리 단순 보정: {'예' if narration_audio is not None else '해당 없음'} (일반적인 오디오 보정 수준)\n"
         f"- 프로그램 생성형 BGM 사용: {music_disclosure}\n"
         "- 사실적으로 생성된 실존 인물/사건 영상: 사용 안 함\n"
-        "합성 음성이 실제 인물의 발언처럼 오해될 수 있는 경우 YouTube 변경/합성 콘텐츠 공개 항목을 확인하세요.\n",
+        "생성형 BGM을 사용했다면 YouTube Studio의 변경/합성 콘텐츠 항목을 확인하세요.\n",
         encoding="utf-8-sig",
     )
 
-    zip_path = temp_root / "shorts_result_v35.zip"
+    zip_path = temp_root / "shorts_result_v40.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in (
-            final_video, audio_path, srt_path, script_path, metadata_path, source_path,
-            visual_path, image_credits_path, license_path, report_path, disclosure_path,
+            final_video, audio_path, srt_path, script_path, metadata_path, naver_metadata_path, source_path,
+            visual_path, license_path, report_path, disclosure_path,
         ):
             archive.write(path, path.name)
 
@@ -2812,18 +1858,18 @@ def render_video(
         "srt": srt_path,
         "script": script_path,
         "metadata": metadata_path,
+        "naver_metadata": naver_metadata_path,
         "source": source_path,
         "visual_sources": visual_path,
-        "image_credits": image_credits_path,
         "music_license": license_path,
         "copyright_report": report_path,
         "ai_disclosure": disclosure_path,
         "zip": zip_path,
     }
 
-# 쇼츠메이커 CLOUD V3.6
-# 제목 자동 적용 + 나레이션 선택 복원 버전
-# 기사 링크를 붙여넣고 Enter를 누르면 제목/대본을 자동 생성합니다.
+# 쇼츠메이커 CLOUD V3.0.1
+# Streamlit Cloud ImportError hotfix
+# shorts_engine 기능을 이 파일 안에 포함해 버전 불일치를 방지합니다.
 
 import hashlib
 import json
@@ -2834,27 +1880,12 @@ from pathlib import Path
 import streamlit as st
 
 
-VERSION = "3.6"
-STATE_PLAN = "v36_plan"
-STATE_RESULT = "v36_result"
-STATE_AUTO_REQUEST = "v36_auto_request"
-
-
-def _request_article_analysis() -> None:
-    """기사 링크 입력을 마치면 분석 예약 플래그만 설정한다."""
-    if str(st.session_state.get("v36-url", "")).strip():
-        st.session_state[STATE_AUTO_REQUEST] = True
-
-
-def _safe_download_name(title: str, suffix: str) -> str:
-    clean = re.sub(r"[\\/:*?\"<>|]+", " ", title or "쇼츠영상")
-    clean = re.sub(r"\s+", " ", clean).strip(" .")
-    clean = clean[:55] or "쇼츠영상"
-    return f"{clean}{suffix}"
-
+VERSION = "4.0.0-copyright-safe"
+STATE_PLAN = "v40_plan"
+STATE_RESULT = "v40_result"
 
 st.set_page_config(
-    page_title="쇼츠메이커 CLOUD V3.6",
+    page_title="쇼츠메이커 CLOUD V4.0 BETA",
     page_icon="🎬",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -2863,38 +1894,33 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-.block-container {max-width:1180px; padding-top:1rem; padding-bottom:4rem;}
-.hero {padding:27px 30px; border-radius:24px; background:linear-gradient(135deg,#10172c,#34266d 56%,#7556df); color:#fff; margin-bottom:16px; box-shadow:0 15px 38px rgba(37,28,91,.2)}
-.hero h1 {font-size:2.05rem; margin:0 0 8px; letter-spacing:-.035em}
-.hero p {font-size:1rem; margin:0; opacity:.95}
-.pills {display:flex; flex-wrap:wrap; gap:8px; margin-top:14px}
+.block-container {max-width: 1180px; padding-top: 1.0rem; padding-bottom: 4rem;}
+.hero {padding: 28px 30px; border-radius: 25px; background:linear-gradient(135deg,#11182f,#33276e 56%,#7355dc); color:white; margin-bottom:16px; box-shadow:0 15px 38px rgba(37,28,91,.2)}
+.hero h1 {font-size:2.1rem; margin:0 0 8px; letter-spacing:-.035em}
+.hero p {font-size:1rem; margin:0; opacity:.94}
+.pills {display:flex; flex-wrap:wrap; gap:8px; margin-top:15px}
 .pill {padding:7px 11px; border:1px solid rgba(255,255,255,.2); background:rgba(255,255,255,.13); border-radius:999px; font-size:.82rem}
-.step {font-size:1.14rem; font-weight:850; margin:17px 0 8px}
-.info-box {padding:14px 16px; border-radius:15px; background:#eef8ff; border:1px solid #c5e4fb; color:#184e72; margin:8px 0 15px}
-.safe-box {padding:14px 16px; border-radius:15px; background:#effbf4; border:1px solid #c4ead2; color:#165c37; margin:8px 0 15px}
-.title-card {padding:20px 22px; border-radius:19px; background:linear-gradient(135deg,#fff4e6,#fff9f2); border:2px solid #ffb45b; margin:12px 0 16px; box-shadow:0 9px 22px rgba(224,117,29,.10)}
-.title-card .label {font-size:.86rem; color:#a65300; font-weight:850; margin-bottom:7px}
-.title-card .title {font-size:1.42rem; line-height:1.38; color:#2b1b11; font-weight:900; letter-spacing:-.025em}
-.title-card .sub {font-size:.84rem; color:#7b5b43; margin-top:8px}
+.cloudbox {padding:16px 18px; border-radius:16px; background:#edf8ff; border:1px solid #b9dfff; color:#164d73; margin:8px 0 18px}
+.safebox {padding:15px 18px; border-radius:16px; background:#effcf5; border:1px solid #bdebd0; color:#155d36; margin:8px 0 18px}
+.step {font-size:1.12rem; font-weight:850; margin:12px 0 7px}
 .note {padding:13px 15px; border-radius:14px; background:#f5f2ff; border:1px solid #ddd5ff; color:#49377a; font-size:.91rem}
 .stButton > button {border-radius:14px; min-height:52px; font-weight:800}
 [data-testid="stDownloadButton"] button {border-radius:12px; font-weight:750}
-@media (max-width:700px) {.hero{padding:21px 19px}.hero h1{font-size:1.62rem}.block-container{padding-left:.8rem;padding-right:.8rem}.title-card .title{font-size:1.18rem}}
+@media (max-width: 700px) {.hero {padding:22px 20px}.hero h1 {font-size:1.65rem}.block-container {padding-left:.8rem; padding-right:.8rem}}
 </style>
 <div class="hero">
-  <h1>🎬 쇼츠메이커 CLOUD V3.6</h1>
-  <p>기사 링크만 넣으면 주목형 제목을 자동 적용하고, 선택한 길이에 정확히 맞춘 영상·권리확인 사진·시그니처 음성을 제작합니다.</p>
+  <h1>⚡ 쇼츠메이커 V4.0 · ENTERTAINMENT</h1>
+  <p>연예뉴스를 30~45초짜리 빠른 쇼츠로 재구성합니다. 후킹 → 전개 → 반전/핵심 → 반응 → 질문까지 리듬을 먼저 설계합니다.</p>
   <div class="pills">
-    <span class="pill">링크 입력 후 제목 자동 생성</span>
-    <span class="pill">여성 참고음성 · 남성 레이어 0%</span>
-    <span class="pill">AI 성우 10종 선택</span>
-    <span class="pill">내 목소리 보정 선택</span>
-    <span class="pill">자동 BGM</span>
-    <span class="pill">동일 인물 권리확인 사진</span>
+    <span class="pill">API 키 입력 없음</span>
+    <span class="pill">개인 PC 서버 불필요</span>
+    <span class="pill">연예뉴스 전용 스토리보드</span>
+    <span class="pill">내 목소리 보정</span>
+    <span class="pill">지루함 자동 감지</span>
   </div>
 </div>
-<div class="info-box"><b>V3.5 핵심</b><br>연예 영상은 밝은 인물 중심 템플릿을 기본으로 사용하고, 기사 주인공의 실제 사진을 공개 라이선스 범위에서 먼저 검색·미리보기합니다. 여성 참고음성 시그니처는 단일 여성 음성만 사용하며 남성 레이어·에코·리버브가 없습니다.</div>
-<div class="safe-box"><b>과장 방지</b><br>클릭을 유도하되 기사에 없는 사실을 만들거나 ‘충격·무조건·100%’ 같은 허위·과장 표현은 사용하지 않습니다.</div>
+<div class="cloudbox"><b>접속 방식</b><br>기존 Streamlit 웹주소 하나만 사용합니다. 집에서는 노트북, 회사에서는 회사 PC, 밖에서는 휴대폰으로 같은 주소를 열면 됩니다. 어느 기기도 서버 역할을 하지 않습니다.</div>
+<div class="safebox"><b>V4.0 제작 원칙</b><br>기사 낭독형 영상이 아니라 1~2초 단위의 화면 변화가 가능한 스토리보드를 먼저 만듭니다. 확인되지 않은 루머는 단정하지 않고, 기사·공개 발언에서 확인되는 범위만 사용합니다.</div>
 """,
     unsafe_allow_html=True,
 )
@@ -2903,16 +1929,16 @@ with st.expander("📱 휴대폰·PC에 바로가기 설치", expanded=False):
     st.markdown(
         """
 - **안드로이드 Chrome:** 오른쪽 위 `⋮` → `홈 화면에 추가` 또는 `앱 설치`
-- **아이폰 Safari:** `공유` → `홈 화면에 추가`
-- **Windows Chrome/Edge:** 주소창 오른쪽 설치 또는 바로가기 아이콘
+- **아이폰 Safari:** 하단 `공유` → `홈 화면에 추가`
+- **Windows Chrome/Edge:** 주소창 오른쪽의 설치 또는 바로가기 아이콘
 
-집·회사·휴대폰에서 동일한 Streamlit 주소를 사용합니다.
+설치 후에도 실제 프로그램은 클라우드에서 실행되므로 집 노트북이나 회사 PC를 켜둘 필요가 없습니다.
 """
     )
 
 with st.expander("다른 기기에서 이어서 수정할 프로젝트 불러오기", expanded=False):
-    project_upload = st.file_uploader("프로젝트 JSON", type=["json"], key="v36-project-import")
-    if project_upload is not None and st.button("프로젝트 불러오기", use_container_width=True, key="v36-project-load"):
+    project_upload = st.file_uploader("프로젝트 JSON", type=["json"], key="project-import")
+    if project_upload is not None and st.button("프로젝트 불러오기", use_container_width=True):
         try:
             payload = json.loads(project_upload.getvalue().decode("utf-8"))
             article = ArticleData(**payload["article"])
@@ -2922,238 +1948,44 @@ with st.expander("다른 기기에서 이어서 수정할 프로젝트 불러오
                 "plan": plan,
                 "category": payload.get("category", "연예"),
                 "duration": int(payload.get("duration", 45)),
-                "title_style": payload.get("title_style", TITLE_STYLE_OPTIONS[0]),
-                "engine": "무키 자체 해설 엔진",
+                "engine": "V4.0 엔터 스토리보드",
             }
-            for key in ("v36-title-choice", "v36-custom-title", "v36-script"):
-                st.session_state.pop(key, None)
             st.session_state.pop(STATE_RESULT, None)
             st.success("프로젝트를 불러왔습니다.")
             st.rerun()
         except Exception as exc:
             st.error(f"프로젝트 파일을 읽지 못했습니다: {exc}")
 
-# 1. 기사 입력
-st.markdown('<div class="step">1. 기사 링크와 제작 조건</div>', unsafe_allow_html=True)
-url = st.text_input(
-    "대표 기사 링크 · 붙여넣고 Enter를 누르면 자동 분석",
-    placeholder="https://m.entertain.naver.com/article/...",
-    key="v36-url",
-    on_change=_request_article_analysis,
+st.markdown('<div class="step">1. 기사와 제작 조건 입력</div>', unsafe_allow_html=True)
+url = st.text_input("대표 기사 링크", placeholder="https://m.entertain.naver.com/article/...")
+manual_title = st.text_input("기사 제목 직접 입력 (링크 분석이 막힐 때만)", placeholder="기사 제목")
+manual_text = st.text_area(
+    "기사 본문 직접 붙여넣기 (선택)",
+    placeholder="네이버 등 일부 사이트에서 본문 추출이 막히면 기사 본문을 붙여넣으세요. 기사 사진은 가져오지 않습니다.",
+    height=130,
 )
-with st.expander("링크 분석이 막힐 때만 기사 제목·본문 직접 입력", expanded=False):
-    manual_title = st.text_input("기사 제목", placeholder="기사 제목", key="v36-manual-title")
-    manual_text = st.text_area(
-        "기사 본문",
-        placeholder="본문 추출이 막힌 경우에만 붙여넣으세요. 사진은 별도 라이선스 검색 단계에서 확인합니다.",
-        height=135,
-        key="v36-manual-text",
-    )
 
-c1, c2, c3 = st.columns(3)
+c1, c2 = st.columns(2)
 with c1:
-    category = st.selectbox("콘텐츠 유형", ["연예", "국내 이슈", "해외 이슈", "경제·주식", "생활정보", "제품·리뷰"], key="v36-category")
+    category = st.selectbox("콘텐츠 유형", ["연예", "아이돌", "배우", "예능", "드라마·영화", "국내 이슈", "해외 이슈"])
 with c2:
-    target_duration = st.selectbox("목표 길이", [30, 45, 60], index=1, format_func=lambda x: f"{x}초", key="v36-duration")
-with c3:
-    title_style = st.selectbox(
-        "자동 제목 스타일",
-        TITLE_STYLE_OPTIONS,
-        index=0,
-        help="가장 높은 점수의 제목이 영상에 자동 적용됩니다.",
-        key="v36-title-style",
-    )
+    target_duration = st.selectbox("목표 길이", [30, 35, 40, 45, 60], index=2, format_func=lambda x: f"{x}초")
 
-# 2. 나레이션 선택 - 계획 생성 전부터 항상 표시
-st.markdown('<div class="step">2. 나레이션 선택</div>', unsafe_allow_html=True)
-narration_mode = st.radio(
-    "사용할 목소리",
-    list(VOICE_PERSONA_OPTIONS),
-    horizontal=False,
-    key="v36-narration-mode",
-)
-voice_persona = VOICE_PERSONA_OPTIONS[narration_mode]
-voice_label = list(VOICE_OPTIONS)[0]
-rate_label = "쇼츠 추천"
-voice_preset_label = "밝고 듣기 좋게"
-uploaded_voice = None
-recorded_audio = None
-ai_voice_profile = ""
-if voice_persona == "yoonyoung_signature":
-    ai_voice_profile = "yoonyoung_signature"
-    st.markdown(
-        '<div class="note"><b>🎙️ 윤영 단독 시그니처</b><br>업로드된 사용자 음성의 낮고 안정적인 중심 톤과 말의 속도만 반영합니다. 남성 보조 음성·울림·에코는 들어가지 않습니다.</div>',
-        unsafe_allow_html=True,
-    )
-elif voice_persona == "yoonyoung_male_hybrid":
-    ai_voice_profile = "yoonyoung_male_hybrid"
-    st.markdown(
-        '<div class="note"><b>🎚️ 윤영×남성 저음 믹스</b><br>이 항목을 직접 고른 경우에만 남성 저음 레이어가 18% 들어갑니다. 여성 시그니처에는 절대 적용되지 않습니다.</div>',
-        unsafe_allow_html=True,
-    )
-elif voice_persona == "adam_trendy":
-    ai_voice_profile = "adam_trendy"
-    st.markdown(
-        '<div class="note"><b>🔥 에덤이 스타일</b><br>요즘 쇼츠에서 자주 들리는 빠르고 선명한 남성형 톤입니다. 정확히 같은 고유 음성 복제가 아니라, 비슷한 분위기의 트렌디 프리셋입니다.</div>',
-        unsafe_allow_html=True,
-    )
-elif voice_persona == "female_reference_signature":
-    ai_voice_profile = "female_reference_signature"
-    st.markdown(
-        '<div class="note"><b>🎧 여성 참고음성 A</b><br>보내주신 여성 참고 음성의 빠른 전달과 밝은 피치를 기준으로 만든 단일 여성 AI 음성입니다. 남성 레이어·딜레이·에코·리버브를 사용하지 않습니다.</div>',
-        unsafe_allow_html=True,
-    )
-elif voice_persona == "female_reference_soft":
-    ai_voice_profile = "female_reference_soft"
-    st.markdown(
-        '<div class="note"><b>🎧 여성 참고음성 B</b><br>같은 참고 음성의 부드럽고 맑은 인상을 기준으로 만든 단일 여성 AI 음성입니다. 미리듣기로 A와 비교할 수 있습니다.</div>',
-        unsafe_allow_html=True,
-    )
-elif voice_persona == "standard":
-    v1, v2 = st.columns(2)
-    with v1:
-        voice_label = st.selectbox("AI 성우", list(VOICE_OPTIONS), index=0, key="v36-ai-voice")
-    with v2:
-        rate_label = st.selectbox("말하기 속도", list(RATE_OPTIONS), index=2, key="v36-ai-rate")
-else:
-    v1, v2 = st.columns(2)
-    with v1:
-        voice_preset_label = st.selectbox("내 목소리 보정 스타일", list(VOICE_PRESET_OPTIONS), index=1, key="v36-my-preset")
-    with v2:
-        uploaded_voice = st.file_uploader("대본 전체를 읽은 음성 파일", type=["wav", "mp3", "m4a", "aac", "ogg"], key="v36-my-upload")
-    if hasattr(st, "audio_input"):
-        recorded_audio = st.audio_input("또는 브라우저에서 직접 녹음", key="v36-my-record")
-    st.caption("직접 읽은 음성을 노이즈 제거·EQ·압축·명료도 보정·톤 변조해 영상에 넣습니다.")
-
-if voice_persona != "recorded":
-    preview_key = f"v35_voice_preview_{voice_persona}_{voice_label}_{rate_label}"
-    if st.button("🔊 선택한 AI 목소리 7초 미리듣기", key="v36-preview-voice"):
-        preview_dir = Path(tempfile.mkdtemp(prefix="voice_preview_v36_"))
-        preview_path = preview_dir / "preview.mp3"
-        preview_text = "지금 가장 궁금한 연예 소식, 핵심만 빠르고 재미있게 알려드릴게요."
-        try:
-            if voice_persona == "yoonyoung_signature":
-                synthesize_yoonyoung_signature_tts(preview_text, preview_dir, preview_path)
-            elif voice_persona == "yoonyoung_male_hybrid":
-                synthesize_hybrid_tts(preview_text, preview_dir, preview_path)
-            elif voice_persona == "female_reference_signature":
-                synthesize_female_reference_tts(preview_text, preview_dir, preview_path)
-            elif voice_persona == "adam_trendy":
-                synthesize_adam_trendy_tts(preview_text, preview_dir, preview_path)
-            elif voice_persona == "female_reference_soft":
-                synthesize_female_reference_soft_tts(preview_text, preview_dir, preview_path)
-            else:
-                synthesize_edge_tts(
-                    preview_text,
-                    VOICE_OPTIONS[voice_label]["voice"],
-                    RATE_OPTIONS[rate_label],
-                    preview_path,
-                )
-            st.session_state[preview_key] = preview_path.read_bytes()
-        except Exception as exc:
-            st.error(f"목소리 미리듣기 생성 실패: {exc}")
-    if st.session_state.get(preview_key):
-        st.audio(st.session_state[preview_key], format="audio/mp3")
-
-# 3. 음악
-st.markdown('<div class="step">3. 배경음악</div>', unsafe_allow_html=True)
-m1, m2, m3 = st.columns(3)
-with m1:
-    music_ui = st.selectbox(
-        "음악 방식",
-        ["콘텐츠에 맞춰 자동 추천", "내장 오리지널 중 직접 선택", "YouTube 오디오 라이브러리 음원 업로드", "음악 사용 안 함"],
-        key="v36-music-mode",
-    )
-with m2:
-    selected_music = st.selectbox("내장 음악", list(MUSIC_TRACK_OPTIONS), disabled=music_ui != "내장 오리지널 중 직접 선택", key="v36-music-track")
-with m3:
-    music_volume_pct = st.slider("배경음악 크기", 3, 25, 10, 1, format="%d%%", disabled=music_ui == "음악 사용 안 함", key="v36-music-volume")
-custom_music_upload = None
-attribution_text = ""
-if music_ui == "YouTube 오디오 라이브러리 음원 업로드":
-    c1, c2 = st.columns(2)
-    with c1:
-        custom_music_upload = st.file_uploader("다운로드한 음원", type=["mp3", "wav", "m4a", "aac", "ogg"], key="v36-music-upload")
-    with c2:
-        attribution_text = st.text_input("저작자 표시 문구 (필요한 곡만)", placeholder="Music: 곡명 - 아티스트", key="v36-attribution")
-
-# 4. 디자인
-st.markdown('<div class="step">4. 영상 디자인</div>', unsafe_allow_html=True)
-d1, d2, d3 = st.columns(3)
-with d1:
-    template_label = st.selectbox("영상 템플릿", list(TEMPLATE_OPTIONS), index=0, key="v36-template")
-with d2:
-    subtitle_label = st.selectbox("자막 스타일", list(SUBTITLE_STYLE_OPTIONS), index=0, key="v36-subtitle")
-with d3:
-    accent_label = st.selectbox("강조 색상", list(ACCENT_COLOR_OPTIONS), index=0, key="v36-accent")
-d4, d5 = st.columns(2)
-with d4:
-    resolution_label = st.selectbox("출력 해상도", list(RESOLUTION_OPTIONS), index=0, key="v36-resolution")
-with d5:
-    show_hook = st.toggle("자동 생성 제목을 영상 상단에 표시", value=True, key="v36-show-title")
-
-sticker_c1, sticker_c2 = st.columns([1, 1.1])
-with sticker_c1:
-    sticker_label = st.selectbox("포인트 글꼴/스티커 템플릿", list(STICKER_STYLE_OPTIONS), index=0, key="v36-sticker-style")
-with sticker_c2:
-    sticker_text = st.text_input("포인트 문구 · 비우면 제목에서 자동 추출", value="", placeholder="예: 샤갈 / 히트 / 긴장되는 순간", key="v36-sticker-text")
-
-visual_mode_label = st.selectbox(
-    "사진 구성 방식",
-    [
-        "자동 · 동일 인물/주제의 권리확인 사진 + 그래픽",
-        "내가 보유한 사진 업로드 + 권리확인 사진 보완",
-        "내가 보유한 사진만 사용",
-        "자체 그래픽만 사용",
-    ],
-    key="v36-visual-mode",
-)
-visual_mode_map = {
-    "자동 · 동일 인물/주제의 권리확인 사진 + 그래픽": "rights_cleared",
-    "내가 보유한 사진 업로드 + 권리확인 사진 보완": "uploaded_plus_rights",
-    "내가 보유한 사진만 사용": "uploaded",
-    "자체 그래픽만 사용": "graphics",
-}
-visual_mode = visual_mode_map[visual_mode_label]
-allow_share_alike = st.toggle(
-    "사진이 부족할 때 CC BY-SA까지 확대 검색 · 출처 표시와 동일조건 의무 확인",
-    value=False,
-    key="v36-sharealike",
-    disabled=visual_mode not in {"rights_cleared", "uploaded_plus_rights"},
-)
-uploaded_visual_files = []
-rights_confirmed = True
-if visual_mode in {"uploaded", "uploaded_plus_rights"}:
-    uploaded_visual_files = st.file_uploader(
-        "직접 보유하거나 영상 사용 허가를 받은 사진",
-        type=["jpg", "jpeg", "png", "webp"],
-        accept_multiple_files=True,
-        key="v36-visual-upload",
-    ) or []
-    rights_confirmed = st.checkbox(
-        "업로드한 사진의 영상 사용 및 수익화 권리를 보유하고 있습니다.",
-        value=False,
-        key="v36-rights-confirm",
-    )
-st.caption("기사 사진은 페이지에 CC/공개 라이선스가 명시된 경우에만 후보로 사용합니다. 일반 네이버·언론사 사진은 자동 복사하지 않고, 같은 인물의 Wikidata/Wikimedia Commons 사진 중 상업적 재사용 라이선스가 확인된 자료를 우선 적용합니다.")
-
-make_plan = st.button("🔥 기사 분석 + 초강력 후킹 제목·대본 자동 생성", type="primary", use_container_width=True, key="v36-make-plan")
-auto_requested = bool(st.session_state.pop(STATE_AUTO_REQUEST, False))
-should_make_plan = make_plan or (auto_requested and url.strip())
-
-if should_make_plan:
+make_plan = st.button("⚡ V4.0 쇼츠 스토리보드 만들기", type="primary", use_container_width=True)
+if make_plan:
     if not url.strip() and not manual_text.strip():
         st.error("기사 링크 또는 기사 본문을 입력해주세요.")
         st.stop()
-    progress = st.progress(0, text="기사에서 확인 가능한 핵심을 분석하고 있습니다.")
+    progress = st.progress(0, text="기사를 확인하고 있습니다.")
     status = st.empty()
     try:
+        article: ArticleData
         if url.strip():
             try:
                 article = fetch_article(url.strip())
             except Exception as exc:
                 if not manual_text.strip():
-                    raise ShortsMakerError(f"기사 본문을 불러오지 못했습니다. 직접 입력 영역에 제목과 본문을 붙여넣어 주세요.\n\n{exc}")
+                    raise ShortsMakerError(f"기사 본문을 불러오지 못했습니다. 아래 본문 입력칸에 내용을 붙여넣어 주세요.\n\n{exc}")
                 article = ArticleData(
                     url=url.strip(),
                     title=manual_title.strip() or "기사 기반 쇼츠",
@@ -3176,33 +2008,19 @@ if should_make_plan:
         if manual_title.strip():
             article.title = manual_title.strip()
 
-        progress.progress(45, text="사실관계를 유지하면서 가장 강한 후킹 제목을 평가하고 있습니다.")
-        raw = generate_zero_key_plan(article, target_duration, category, title_style)
+        progress.progress(42, text="기사 문장이 아닌 핵심어와 수치를 분리했습니다.")
+        raw = generate_zero_key_plan(article, target_duration, category)
         plan = normalize_plan(raw, article, target_duration)
-        # 1위 제목을 즉시 영상 제목으로 자동 확정한다.
-        if plan.get("title_candidates"):
-            plan["video_title"] = plan["title_candidates"][0]
-        preview_visuals: list[LicensedVisual] = []
-        if visual_mode in {"rights_cleared", "uploaded_plus_rights"}:
-            progress.progress(72, text="기사 주인공의 합법적 사용 가능 사진을 찾고 있습니다.")
-            preview_visuals = find_rights_cleared_visuals(
-                article, plan, allow_share_alike=allow_share_alike, limit=10
-            )
-        progress.progress(100, text="제목·대본·사진 후보를 준비했습니다.")
-        status.success(f"자동 적용 제목: {plan['video_title']}")
+        progress.progress(100, text="대본이 준비됐습니다.")
+        status.success(f"완료: V4.0 엔터 스토리보드 · {len(plan['scenes'])}개 컷")
         st.session_state[STATE_PLAN] = {
             "article": article,
             "plan": plan,
             "category": category,
             "duration": target_duration,
-            "title_style": title_style,
-            "engine": "무키 자체 해설 엔진",
-            "visual_preview": [asdict(v) for v in preview_visuals],
-            "visual_allow_share_alike": bool(allow_share_alike),
+            "engine": "V4.0 엔터 스토리보드",
         }
         st.session_state.pop(STATE_RESULT, None)
-        for key in ("v36-title-choice", "v36-custom-title", "v36-script"):
-            st.session_state.pop(key, None)
     except ShortsMakerError as exc:
         progress.empty(); status.empty(); st.error(str(exc))
     except Exception as exc:
@@ -3214,146 +2032,190 @@ if plan_state:
     plan = plan_state["plan"]
     category = plan_state["category"]
     duration = int(plan_state["duration"])
-    active_title_style = plan_state.get("title_style", plan.get("title_style", TITLE_STYLE_OPTIONS[0]))
 
     st.divider()
-    st.markdown('<div class="step">5. 자동 적용 제목과 대본 확인</div>', unsafe_allow_html=True)
-
-    candidates = plan.get("title_candidates") or [plan.get("video_title") or article.title]
-    selected_candidate = st.radio(
-        "제목 후보를 바꾸면 영상 제목도 즉시 변경됩니다",
-        candidates,
-        index=candidates.index(plan["video_title"]) if plan.get("video_title") in candidates else 0,
-        key="v36-title-choice",
-    )
-    custom_title = st.text_input(
-        "직접 수정할 제목 (비워두면 위에서 선택한 제목 사용)",
-        value="",
-        placeholder="직접 바꾸고 싶은 경우에만 입력",
-        key="v36-custom-title",
-    )
-    applied_title = custom_title.strip() or selected_candidate
-    plan["video_title"] = applied_title
-
-    st.markdown(
-        f'<div class="title-card"><div class="label">🔥 현재 영상에 자동 적용되는 제목</div><div class="title">{html_lib.escape(applied_title)}</div><div class="sub">영상 상단 제목·YouTube 업로드 정보·다운로드 파일명에 반영됩니다.</div></div>',
-        unsafe_allow_html=True,
-    )
-
-    selected_visuals: list[LicensedVisual] = []
-    if visual_mode in {"rights_cleared", "uploaded_plus_rights"}:
-        st.markdown("**📸 기사 주인공 실제 사진 · 라이선스 확인 결과**")
-        preview_dicts = plan_state.get("visual_preview") or []
-        preview_visuals = [LicensedVisual(**item) for item in preview_dicts]
-        preview_stale = bool(plan_state.get("visual_allow_share_alike", False)) != bool(allow_share_alike)
-        if preview_stale or st.button("🔎 사진 라이선스 다시 검색", key="v36-refresh-visuals"):
-            with st.spinner("Wikidata·Wikimedia Commons와 기사 페이지의 공개 라이선스를 다시 확인하고 있습니다."):
-                preview_visuals = find_rights_cleared_visuals(
-                    article, plan, allow_share_alike=allow_share_alike, limit=10
-                )
-            plan_state["visual_preview"] = [asdict(v) for v in preview_visuals]
-            plan_state["visual_allow_share_alike"] = bool(allow_share_alike)
-            st.session_state[STATE_PLAN] = plan_state
-
-        if preview_visuals:
-            cols = st.columns(min(4, len(preview_visuals)))
-            for idx, visual in enumerate(preview_visuals[:8]):
-                with cols[idx % len(cols)]:
-                    st.image(visual.thumb_url, use_container_width=True)
-                    st.caption(f"{_short_caption(visual.title, 38)}\n{visual.license_short} · {visual.source}")
-            visual_labels = [
-                f"{idx + 1}. {_short_caption(v.title, 46)} · {v.license_short}"
-                for idx, v in enumerate(preview_visuals)
-            ]
-            chosen_labels = st.multiselect(
-                "영상에 사용할 사진 · 기본값은 검색된 사진 전체",
-                visual_labels,
-                default=visual_labels,
-                key="v36-selected-visuals",
-            )
-            selected_indexes = {visual_labels.index(label) for label in chosen_labels if label in visual_labels}
-            selected_visuals = [v for idx, v in enumerate(preview_visuals) if idx in selected_indexes]
-            st.success(f"사용 가능한 실제 인물·주제 사진 {len(selected_visuals)}장을 영상 장면에 우선 적용합니다.")
-        else:
-            st.warning(
-                "이 기사 주인공의 상업적 재사용 가능 사진을 자동으로 확인하지 못했습니다. "
-                "기사 사진을 무단 복사하지 않고, 사용 허가를 받은 사진을 직접 올리거나 자체 그래픽을 사용합니다."
-            )
-
-    t1, t2 = st.columns([1, 1])
-    with t1:
-        if st.button("🔄 다른 분위기의 제목 후보 만들기", use_container_width=True, key="v36-new-title-style"):
-            style_index = TITLE_STYLE_OPTIONS.index(active_title_style) if active_title_style in TITLE_STYLE_OPTIONS else 0
-            next_style = TITLE_STYLE_OPTIONS[(style_index + 1) % len(TITLE_STYLE_OPTIONS)]
-            refreshed = generate_attention_titles(article, category, style=next_style)
-            plan["title_candidates"] = refreshed
-            plan["video_title"] = refreshed[0]
-            plan["title_style"] = next_style
-            st.session_state[STATE_PLAN]["title_style"] = next_style
-            st.session_state[STATE_PLAN]["plan"] = plan
-            for key in ("v36-title-choice", "v36-custom-title"):
-                st.session_state.pop(key, None)
-            st.rerun()
-    with t2:
-        st.caption(f"현재 제목 스타일: {active_title_style}")
-
-    edited_script = st.text_area(
-        "읽을 전체 대본 · 직접 수정 가능",
-        value=plan["narration"],
-        height=270,
-        key="v36-script",
-    )
-
-    col_info, col_save = st.columns([1.2, 1])
-    with col_info:
-        st.markdown("**프로그램이 확인한 정보**")
+    st.markdown('<div class="step">2. 대본 확인·수정</div>', unsafe_allow_html=True)
+    left, right = st.columns([1.15, 1])
+    with left:
+        edited_title = st.text_input("영상 제목", value=plan["video_title"], key="edit-title")
+        edited_script = st.text_area("읽을 전체 대본", value=plan["narration"], height=270, key="edit-script")
+        if st.button("✍️ 수정 대본을 장면에 적용", use_container_width=True):
+            try:
+                plan["video_title"] = edited_title.strip() or plan["video_title"]
+                plan = plan_from_edited_narration(plan, edited_script, article, duration)
+                st.session_state[STATE_PLAN]["plan"] = plan
+                st.success("수정한 문장 기준으로 자막과 장면을 다시 나눴습니다.")
+                st.rerun()
+            except ShortsMakerError as exc:
+                st.error(str(exc))
+    with right:
+        st.markdown("**프로그램이 추출한 정보**")
         for fact in plan.get("core_facts") or [article.title]:
             st.write(f"• {fact}")
         overlap = int(plan.get("originality_overlap_words") or 0)
         if overlap >= 8:
-            st.warning(f"기사 원문과 최대 {overlap}어절이 연속으로 겹칠 수 있습니다. 대본을 조금 더 수정하는 편이 안전합니다.")
+            st.warning(f"기사 원문과 최대 {overlap}어절이 연속으로 겹칠 수 있습니다. 대본을 한 번 더 수정하는 편이 안전합니다.")
         else:
             st.success(f"원문 연속 유사 표현 검사: 최대 {overlap}어절")
-    with col_save:
         project_payload = {
             "version": VERSION,
             "article": asdict(article),
-            "plan": {**plan, "video_title": applied_title, "narration": edited_script},
+            "plan": plan,
             "category": category,
             "duration": duration,
-            "title_style": active_title_style,
         }
         st.download_button(
             "💾 다른 기기용 프로젝트 저장",
             json.dumps(project_payload, ensure_ascii=False, indent=2).encode("utf-8"),
-            file_name="shorts_project_v36.json",
+            file_name="shorts_project_v40.json",
             mime="application/json",
             use_container_width=True,
         )
-        selected_voice_summary = narration_mode if voice_persona != "recorded" else f"내 목소리 직접 녹음 · {voice_preset_label}"
-        st.markdown(
-            f'<div class="note"><b>현재 제작 설정</b><br>제목: {html_lib.escape(applied_title)}<br>목소리: {html_lib.escape(selected_voice_summary)}<br>음악: {html_lib.escape(music_ui)}</div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown('<div class="note"><b>기기 간 사용</b><br>새 영상은 어느 기기에서든 바로 만들 수 있습니다. 작업 중인 대본을 다른 기기로 옮길 때는 위 프로젝트 파일을 저장한 뒤 불러오세요.</div>', unsafe_allow_html=True)
 
-    render = st.button("🎬 이 제목·목소리로 쇼츠 완성하기", type="primary", use_container_width=True, key="v36-render")
+    st.markdown('<div class="step">3. V4.0 스토리보드 · 지루함 검사</div>', unsafe_allow_html=True)
+    pacing = _v40_pacing_report(plan, duration)
+    pc1, pc2, pc3 = st.columns(3)
+    pc1.metric("리듬 점수", f"{pacing['score']} / 100")
+    pc2.metric("총 컷", f"{len(plan.get('scenes') or [])}컷")
+    pc3.metric("평균 컷 길이", f"{pacing['avg_cut']:.1f}초")
+    if pacing['warnings']:
+        for warning in pacing['warnings']:
+            st.warning("⚠️ " + warning)
+    else:
+        st.success("빠른 쇼츠 기준 리듬 검사 통과")
+    for idx, scene in enumerate(plan.get("scenes") or [], start=1):
+        role = scene.get("role") or _v40_role(idx-1, len(plan.get("scenes") or []))
+        with st.expander(f"CUT {idx:02d} · {role} · {scene.get('caption','')}", expanded=idx <= 3):
+            st.write(scene.get("narration", ""))
+            st.caption("화면 지시: " + (scene.get("visual_note") or "자료 컷 + 키워드 강조"))
+            if scene.get("emphasis"):
+                st.caption("강조: " + " / ".join(scene.get("emphasis") or []))
+
+    st.markdown('<div class="step">4. 실제 자료 · 저작권 사전검사</div>', unsafe_allow_html=True)
+    st.caption("YouTube Shorts + 네이버 클립 동시 게시를 기준으로 보수적으로 검사합니다. 출처 표기만으로 사용 권한이 생기지는 않습니다.")
+    uploaded_visuals = st.file_uploader(
+        "관련 실제 사진·이미지 업로드 (승인된 자료만 영상에 사용)",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+        key="copyright-visuals",
+    )
+    asset_audits = []
+    for idx, up in enumerate(uploaded_visuals or []):
+        with st.expander(f"자료 {idx+1:02d} · {up.name}", expanded=idx < 2):
+            c1, c2 = st.columns(2)
+            with c1:
+                source_type = st.selectbox("자료 유형", COPYRIGHT_SOURCE_OPTIONS, key=f"source-type-{idx}")
+            with c2:
+                basis = st.selectbox("사용 근거", COPYRIGHT_BASIS_OPTIONS, key=f"rights-basis-{idx}")
+            audit = audit_visual_rights(source_type, basis)
+            audit.update({"name": up.name, "source_type": source_type, "basis": basis, "upload": up})
+            asset_audits.append(audit)
+            if audit["grade"] == "GREEN": st.success(f"{audit['label']} · {audit['reason']}")
+            elif audit["grade"] == "YELLOW": st.warning(f"{audit['label']} · {audit['reason']} · 자동 렌더링에서 제외")
+            else: st.error(f"{audit['label']} · {audit['reason']} · 자동 렌더링에서 제외")
+    approved_count = sum(1 for row in asset_audits if row["grade"] == "GREEN")
+    if uploaded_visuals:
+        st.info(f"업로드 {len(uploaded_visuals)}개 중 렌더링 사용 가능 {approved_count}개")
+    else:
+        st.info("실제 자료가 없으면 안전한 자체 그래픽 fallback을 사용합니다. 연예 콘텐츠는 사용권이 확인된 실제 인물 자료 업로드를 권장합니다.")
+
+    st.markdown('<div class="step">5. 나레이션 선택</div>', unsafe_allow_html=True)
+    narration_mode = st.radio("나레이션 방식", ["AI 성우로 자동 제작", "내 목소리 녹음·업로드 후 보정"], horizontal=True)
+    voice_label = list(VOICE_OPTIONS)[0]
+    rate_label = "쇼츠 추천"
+    voice_preset_label = "밝고 듣기 좋게"
+    uploaded_voice = None
+    recorded_audio = None
+    if narration_mode == "AI 성우로 자동 제작":
+        v1, v2 = st.columns(2)
+        with v1:
+            voice_label = st.selectbox("AI 성우", list(VOICE_OPTIONS), index=0)
+        with v2:
+            rate_label = st.selectbox("말하기 속도", list(RATE_OPTIONS), index=2)
+        st.caption("AI 성우는 별도 키 입력 없이 동작하지만, 외부 음성 서비스 상태에 따라 일시적으로 지연될 수 있습니다.")
+    else:
+        v1, v2 = st.columns(2)
+        with v1:
+            voice_preset_label = st.selectbox("내 목소리 보정 스타일", list(VOICE_PRESET_OPTIONS), index=1)
+        with v2:
+            uploaded_voice = st.file_uploader("대본 전체를 읽은 녹음 파일", type=["wav", "mp3", "m4a", "aac", "ogg"])
+        if hasattr(st, "audio_input"):
+            recorded_audio = st.audio_input("또는 지금 대본을 직접 녹음")
+        st.caption("올려주신 짧은 목소리 샘플로 새 문장을 복제하는 방식이 아니라, 대본 전체 녹음을 밝게·재밌게·차분하게 보정하는 방식입니다.")
+
+    st.markdown('<div class="step">6. 콘텐츠별 자동 배경음악</div>', unsafe_allow_html=True)
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        music_ui = st.selectbox("음악 방식", ["음악 사용 안 함", "콘텐츠에 맞춰 자동 추천", "내장 오리지널 중 직접 선택", "YouTube 오디오 라이브러리 음원 업로드"])
+    with m2:
+        selected_music = st.selectbox("내장 음악", list(MUSIC_TRACK_OPTIONS), disabled=music_ui != "내장 오리지널 중 직접 선택")
+    with m3:
+        music_volume_pct = st.slider("배경음악 크기", 3, 25, 10, 1, format="%d%%", disabled=music_ui == "음악 사용 안 함")
+    custom_music_upload = None
+    attribution_text = ""
+    cross_platform_music_confirmed = False
+    if music_ui == "YouTube 오디오 라이브러리 음원 업로드":
+        c1, c2 = st.columns(2)
+        with c1:
+            custom_music_upload = st.file_uploader("다운로드한 음원", type=["mp3", "wav", "m4a", "aac", "ogg"], key="music-upload")
+        with c2:
+            attribution_text = st.text_input("저작자 표시 문구 (필요한 곡만)", placeholder="Music: 곡명 - 아티스트")
+        cross_platform_music_confirmed = st.checkbox("이 음원의 YouTube Shorts와 네이버 클립 양쪽 상업적 사용·재편집 조건을 직접 확인했습니다.")
+
+    st.markdown('<div class="step">7. 영상 디자인</div>', unsafe_allow_html=True)
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        template_label = st.selectbox("영상 템플릿", list(TEMPLATE_OPTIONS), index=0)
+    with d2:
+        subtitle_label = st.selectbox("자막 스타일", list(SUBTITLE_STYLE_OPTIONS), index=0)
+    with d3:
+        accent_label = st.selectbox("강조 색상", list(ACCENT_COLOR_OPTIONS), index=0)
+    d4, d5 = st.columns(2)
+    with d4:
+        resolution_label = st.selectbox("출력 해상도", list(RESOLUTION_OPTIONS), index=0)
+    with d5:
+        show_hook = st.toggle("상단 후킹 제목", value=True)
+    st.caption("V4.0은 스토리보드 컷 역할에 따라 줌·타이포·비교·반응 카드 등 화면 변화를 우선 배치합니다. 실제 기사/방송 자료 사용 시 권리 확인이 필요합니다.")
+
+    music_audit = music_rights_audit(music_ui, cross_platform_music_confirmed)
+    st.markdown("#### 🛡️ 최종 저작권 게이트")
+    a1, a2, a3 = st.columns(3)
+    a1.metric("승인 시각자료", f"{approved_count}개")
+    a2.metric("확인 필요/제외", f"{sum(1 for x in asset_audits if x['grade'] != 'GREEN')}개")
+    a3.metric("음원", music_audit["label"])
+    if music_audit["grade"] == "YELLOW": st.warning(music_audit["reason"])
+    elif music_audit["grade"] == "RED": st.error(music_audit["reason"])
+    else: st.success("등록된 사용 자료와 음원 기준으로 사전 저작권 게이트를 통과했습니다. 확인 필요/제외 자료는 영상에 사용하지 않습니다.")
+
+    render = st.button("🎬 저작권 안전 자료만 사용해 쇼츠 완성하기", type="primary", use_container_width=True)
     if render:
         source_audio = uploaded_voice or recorded_audio
-        if voice_persona == "recorded" and source_audio is None:
-            st.error("내 목소리 직접 녹음 방식을 선택하셨습니다. 대본 전체를 읽은 음성 파일을 올리거나 직접 녹음해주세요.")
+        if narration_mode != "AI 성우로 자동 제작" and source_audio is None:
+            st.error("내 목소리 방식은 대본 전체를 읽은 녹음 파일 또는 브라우저 녹음이 필요합니다.")
             st.stop()
         if music_ui == "YouTube 오디오 라이브러리 음원 업로드" and custom_music_upload is None:
-            st.error("사용할 YouTube 오디오 라이브러리 음원을 업로드해주세요.")
+            st.error("사용할 음원을 업로드해주세요.")
             st.stop()
 
-        plan["video_title"] = applied_title
+        # 화면에서 마지막으로 수정한 대본을 자동 반영
+        plan["video_title"] = edited_title.strip() or plan["video_title"]
         plan = plan_from_edited_narration(plan, edited_script, article, duration)
-        plan["video_title"] = applied_title
-        if applied_title not in plan.get("title_candidates", []):
-            plan.setdefault("title_candidates", []).insert(0, applied_title)
         st.session_state[STATE_PLAN]["plan"] = plan
 
-        workdir = Path(tempfile.mkdtemp(prefix="shortsmaker_cloud_v36_"))
+        if music_audit["grade"] != "GREEN":
+            st.error("음원 권리 확인이 완료되지 않았습니다. 음악 사용 안 함을 선택하거나 양 플랫폼 사용 조건을 확인해주세요.")
+            st.stop()
+
+        workdir = Path(tempfile.mkdtemp(prefix="shortsmaker_v40_safe_"))
+        approved_visual_paths = []
+        for idx, row in enumerate(asset_audits):
+            if row["grade"] != "GREEN":
+                continue
+            suffix = Path(row["name"]).suffix.lower() or ".jpg"
+            safe_path = workdir / f"approved_visual_{idx:02d}{suffix}"
+            safe_path.write_bytes(row["upload"].getvalue())
+            approved_visual_paths.append(safe_path)
         narration_path = None
         if source_audio is not None:
             suffix = Path(getattr(source_audio, "name", "voice.wav")).suffix or ".wav"
@@ -3364,16 +2226,6 @@ if plan_state:
             suffix = Path(custom_music_upload.name).suffix or ".mp3"
             custom_music_path = workdir / f"custom_music{suffix}"
             custom_music_path.write_bytes(custom_music_upload.getvalue())
-
-        if visual_mode in {"uploaded", "uploaded_plus_rights"} and (not uploaded_visual_files or not rights_confirmed):
-            st.error("직접 사진 사용 방식을 선택했습니다. 사진을 올리고 사용 권한 확인란을 체크해주세요.")
-            st.stop()
-        user_visual_paths: list[Path] = []
-        for idx, uploaded_image in enumerate(uploaded_visual_files):
-            suffix = Path(uploaded_image.name).suffix.lower() or ".jpg"
-            target = workdir / f"user_visual_{idx:02}{suffix}"
-            target.write_bytes(uploaded_image.getvalue())
-            user_visual_paths.append(target)
 
         music_mode_map = {
             "콘텐츠에 맞춰 자동 추천": "auto",
@@ -3406,18 +2258,20 @@ if plan_state:
                 music_track=selected_music if music_ui == "내장 오리지널 중 직접 선택" else "자동 추천",
                 music_volume=music_volume_pct / 100.0,
                 custom_music=custom_music_path,
-                ai_voice_profile=ai_voice_profile,
-                target_duration=duration,
-                visual_mode=visual_mode,
-                allow_share_alike=allow_share_alike,
-                user_visuals=user_visual_paths,
-                licensed_visuals_override=selected_visuals,
-                sticker_style=STICKER_STYLE_OPTIONS[sticker_label],
-                sticker_text=sticker_text.strip(),
+                approved_visuals=approved_visual_paths,
             )
             if attribution_text.strip():
                 with files["music_license"].open("a", encoding="utf-8") as fh:
                     fh.write(f"\n사용자 입력 저작자 표시: {attribution_text.strip()}\n")
+            safe_rows = [{k:v for k,v in row.items() if k != "upload"} for row in asset_audits]
+            safe_report = build_copyright_report(safe_rows, music_audit, int(plan.get("originality_overlap_words") or 0))
+            safe_report_path = workdir / "copyright_preflight_v40.txt"
+            safe_report_path.write_text(safe_report, encoding="utf-8-sig")
+            with files["copyright_report"].open("a", encoding="utf-8") as fh:
+                fh.write("\n\n" + safe_report)
+            files["copyright_preflight"] = safe_report_path
+            with zipfile.ZipFile(files["zip"], "a", zipfile.ZIP_DEFLATED) as archive:
+                archive.write(safe_report_path, safe_report_path.name)
             progress.progress(100, text="완성됐습니다.")
             status.success("영상·자막·음성·출처·권리 점검 파일을 만들었습니다.")
             result_key = hashlib.sha256(files["video"].read_bytes()[:4096]).hexdigest()
@@ -3425,7 +2279,6 @@ if plan_state:
                 "key": result_key,
                 "article": article,
                 "plan": plan,
-                "title": applied_title,
                 **{name: path.read_bytes() for name, path in files.items()},
             }
         except ShortsMakerError as exc:
@@ -3436,34 +2289,20 @@ if plan_state:
 result = st.session_state.get(STATE_RESULT)
 if result:
     st.divider()
-    st.subheader("완성 영상")
-    st.markdown(
-        f'<div class="title-card"><div class="label">YouTube 업로드 제목</div><div class="title">{html_lib.escape(result.get("title") or result["plan"]["video_title"])}</div></div>',
-        unsafe_allow_html=True,
-    )
     left, right = st.columns([1, 1])
     with left:
+        st.subheader("완성 영상")
         st.video(result["video"], format="video/mp4")
-        st.download_button(
-            "⬇️ MP4 영상 다운로드",
-            result["video"],
-            _safe_download_name(result.get("title") or "쇼츠영상", ".mp4"),
-            "video/mp4",
-            type="primary",
-            use_container_width=True,
-            key=f"v36-video-{result['key']}",
-        )
-        st.download_button(
-            "⬇️ 결과 전체 ZIP",
-            result["zip"],
-            _safe_download_name(result.get("title") or "쇼츠영상", "_전체파일.zip"),
-            "application/zip",
-            use_container_width=True,
-            key=f"v36-zip-{result['key']}",
-        )
+        st.download_button("⬇️ 결과 전체 ZIP", result["zip"], "shorts_v40_safe_result.zip", "application/zip", type="primary", use_container_width=True, key=f"zip-{result['key']}")
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button("MP4 다운로드", result["video"], "final_short_v40_safe.mp4", "video/mp4", use_container_width=True)
+        with d2:
+            st.download_button("나레이션 다운로드", result["audio"], "narration_v40.mp3", "audio/mpeg", use_container_width=True)
     with right:
-        st.download_button("대본 TXT", result["script"], "script.txt", "text/plain", use_container_width=True, key=f"v36-script-dl-{result['key']}")
-        st.download_button("자막 SRT", result["srt"], "subtitles.srt", "text/plain", use_container_width=True, key=f"v36-srt-{result['key']}")
-        st.download_button("YouTube 제목·설명", result["metadata"], "youtube_metadata.txt", "text/plain", use_container_width=True, key=f"v36-meta-{result['key']}")
-        st.download_button("저작권 점검 보고서", result["copyright_report"], "copyright_check_report.txt", "text/plain", use_container_width=True, key=f"v36-copy-{result['key']}")
-        st.markdown('<div class="note"><b>업로드 순서</b><br>MP4를 YouTube Shorts에 올리고, `youtube_metadata.txt`의 제목·설명·해시태그를 복사하세요.</div>', unsafe_allow_html=True)
+        st.subheader("저작권 안전 점검")
+        st.text(result["copyright_report"].decode("utf-8-sig", errors="replace"))
+        st.download_button("점검 보고서", result["copyright_report"], "copyright_check_report.txt", "text/plain", use_container_width=True)
+        st.download_button("AI 공개 안내", result["ai_disclosure"], "ai_disclosure.txt", "text/plain", use_container_width=True)
+
+st.caption("V4.0 COPYRIGHT SAFE · 확인 필요/사용 제외 자료는 자동 렌더링에서 배제합니다. 자동 검사는 위험을 낮추는 보수적 사전 필터이며 법적 무침해를 보증하지 않습니다.")

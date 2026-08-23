@@ -1,3 +1,2 @@
 ffmpeg
-fonts-nanum
 fonts-noto-cjk
